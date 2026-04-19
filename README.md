@@ -61,3 +61,6 @@ Then chat with your bot in Telegram using messages like:
 
 
 Search behavior: free-text search is performed over the latest fetched Yle Finnish news corpus and the bot echoes the exact search term used back to the user for refinement in follow-up chats.
+
+
+This version supports only category-based Telegram news requests from official Yle RSS feeds. Free-text search has been removed.

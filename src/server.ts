@@ -62,15 +62,12 @@ type DeliveryState = {
 };
 
 type ParsedTelegramIntent = {
-  action: "help" | "categories" | "category_news" | "search" | "refine_search";
+  action: "help" | "categories" | "category_news" | "latest_news" | "unsupported_search";
   count?: number;
   categories?: string[];
-  searchTerm?: string;
-  refineText?: string;
 };
 
 type TelegramAgentState = {
-  lastSearchTerm: string | null;
   lastResultSummary: string | null;
   lastCategories: string[];
   lastCount: number;
@@ -88,7 +85,7 @@ export type BriefingState = {
 
 function decodeXml(value: string): string {
   return value
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    .replace(/<!\[CDATA\[([\\s\\S]*?)\]\]>/g, "$1")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
@@ -158,7 +155,7 @@ function classifyCategory(text: string, rssCategories: string[] = []): CategoryK
 }
 
 function parseRss(xml: string): Story[] {
-  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
+  const items = [...xml.matchAll(/<item>([\\s\\S]*?)<\/item>/gi)];
   return items
     .map((match) => {
       const item = match[1];
@@ -231,17 +228,9 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-function logDebug(event: string, data: Record<string, unknown>) {
-  console.log(`${event} ${JSON.stringify(data)}`);
-}
-
-function previewText(value: string, length = 240): string {
-  return value.replace(/\s+/g, ' ').trim().slice(0, length);
-}
-
 function parseModelJson(text: string) {
   const trimmed = text.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const fenced = trimmed.match(/^```(?:json)?\s*([\\s\\S]*?)\s*```$/i);
   const candidate = fenced ? fenced[1].trim() : trimmed;
   return JSON.parse(candidate);
 }
@@ -367,17 +356,23 @@ async function getTelegramWebhookInfo(env: Env) {
   return telegramApi(env, "getWebhookInfo", {});
 }
 
+const SUPPORTED_TELEGRAM_CATEGORY_KEYS = Object.keys(YLE_RSS_BY_CATEGORY) as CategoryKey[];
+
 function categoriesHelpText(): string {
   return [
     "Tuetut uutiskategoriat:",
-    ...CATEGORY_DEFINITIONS.map((category) => `- ${category.label} (${category.key})`),
+    ...SUPPORTED_TELEGRAM_CATEGORY_KEYS.map((key) => {
+      const category = CATEGORY_DEFINITIONS.find((item) => item.key === key);
+      return `- ${category?.label || key} (${key})`;
+    }),
     "",
     "Esimerkkejä:",
     '• "Anna 3 uusinta talousuutista"',
+    '• "Anna 5 politiikan uutista"',
+    '• "Urheilu 3"',
     '• "Mitkä kategoriat ovat käytössä?"',
-    '• "Hae uutisia hakusanalla datakeskus"',
-    '• "Etsi uutisia sanoilla Nato Suomi"',
-    '• "Tarkenna hakua lisäämällä Oulu"',
+    "",
+    "Vapaa hakusana ei ole käytössä tässä versiossa.",
   ].join("\n");
 }
 
@@ -391,13 +386,13 @@ function normalizeRequestedCategories(values?: string[]): CategoryKey[] {
   const normalized = values
     .map((value) => value.toLowerCase().trim())
     .map((value) => {
-      if (CATEGORY_KEYS.has(value as CategoryKey)) return value as CategoryKey;
-      const found = CATEGORY_DEFINITIONS.find(
-        (category) => category.label.toLowerCase() === value || category.keywords.includes(value),
-      );
+      const found = CATEGORY_DEFINITIONS.find((category) => {
+        const aliases = [category.key, category.label.toLowerCase(), ...category.keywords];
+        return aliases.includes(value);
+      });
       return found?.key;
     })
-    .filter((value): value is CategoryKey => Boolean(value));
+    .filter((value): value is CategoryKey => Boolean(value) && SUPPORTED_TELEGRAM_CATEGORY_KEYS.includes(value as CategoryKey));
   return Array.from(new Set(normalized));
 }
 
@@ -417,7 +412,6 @@ function formatStoryList(stories: Story[], count: number): string {
 
 
 async function fetchStoriesFromFeed(feedUrl: string, limit = 12): Promise<Story[]> {
-  logDebug("rss.fetch.start", { feedUrl, limit });
   const response = await fetch(feedUrl, {
     headers: {
       "user-agent": "ylesignal/1.0",
@@ -426,34 +420,17 @@ async function fetchStoriesFromFeed(feedUrl: string, limit = 12): Promise<Story[
     redirect: "follow",
   });
 
-  const xml = await response.text();
-  logDebug("rss.fetch.response", {
-    feedUrl,
-    status: response.status,
-    ok: response.ok,
-    finalUrl: response.url,
-    contentType: response.headers.get("content-type"),
-    preview: previewText(xml, 500),
-  });
-
   if (!response.ok) {
     throw new Error(`Yle RSS request failed with ${response.status} for ${feedUrl}`);
   }
 
-  const allStories = parseRss(xml);
-  const stories = allStories.slice(0, limit);
-  logDebug("rss.parse.result", {
-    feedUrl,
-    parsedCount: allStories.length,
-    returnedCount: stories.length,
-    firstThree: stories.slice(0, 3).map((story) => ({
-      title: story.title,
-      link: story.link,
-      pubDate: story.pubDate,
-      category: story.category,
-    })),
-  });
-
+  const xml = await response.text();
+  const stories = parseRss(xml).slice(0, limit);
+  if (stories.length === 0) {
+    console.log("rss.empty", JSON.stringify({ feedUrl, status: response.status, contentType: response.headers.get("content-type"), preview: xml.slice(0, 300) }));
+  } else {
+    console.log("rss.ok", JSON.stringify({ feedUrl, count: stories.length, firstTitle: stories[0]?.title }));
+  }
   return stories;
 }
 
@@ -463,30 +440,16 @@ async function fetchLatestStoriesFromYle(limit = 12): Promise<Story[]> {
 
 async function fetchStoriesByCategories(categories: string[], limit = 12): Promise<Story[]> {
   const normalized = normalizeRequestedCategories(categories);
-  logDebug("rss.category.request", { categories, normalized, limit });
   if (normalized.length === 0) return fetchLatestStoriesFromYle(limit);
 
   const feeds = Array.from(new Set(normalized.map((c) => YLE_RSS_BY_CATEGORY[c]).filter(Boolean)));
-  logDebug("rss.category.feeds", { normalized, feeds });
   if (feeds.length === 0) {
     const latest = await fetchLatestStoriesFromYle(Math.max(limit * 3, 24));
-    const filtered = latest.filter((story) => normalized.includes(story.category || "yleinen")).slice(0, limit);
-    logDebug("rss.category.filtered_latest", {
-      normalized,
-      latestCount: latest.length,
-      filteredCount: filtered.length,
-      sample: filtered.slice(0, 5).map((story) => ({ title: story.title, category: story.category, pubDate: story.pubDate, link: story.link })),
-    });
-    return filtered;
+    return latest.filter((story) => normalized.includes(story.category || "yleinen")).slice(0, limit);
   }
 
   const perFeed = Math.max(limit, 8);
   const collected = (await Promise.all(feeds.map((feed) => fetchStoriesFromFeed(feed, perFeed)))).flat();
-  logDebug("rss.category.collected", {
-    normalized,
-    collectedCount: collected.length,
-    sample: collected.slice(0, 5).map((story) => ({ title: story.title, category: story.category, pubDate: story.pubDate, link: story.link })),
-  });
   const deduped: Story[] = [];
   const seen = new Set<string>();
   for (const story of collected) {
@@ -501,41 +464,14 @@ async function fetchStoriesByCategories(categories: string[], limit = 12): Promi
   return deduped.slice(0, limit);
 }
 
-async function searchNewsFromYle(query: string, limit = 5): Promise<Story[]> {
-  const corpus = await fetchLatestStoriesFromYle(80);
-  const terms = tokenizeSearchTerm(query);
-  const ranked = rankStoriesBySearch(corpus, query);
-  logDebug("rss.search", {
-    query,
-    terms,
-    corpus: corpus.length,
-    matched: ranked.length,
-    sample: ranked.slice(0, 5).map((story) => ({ title: story.title, pubDate: story.pubDate, link: story.link, category: story.category })),
-  });
-  return ranked.slice(0, limit);
-}
-
-function formatSearchResponse(searchTerm: string, stories: Story[], count: number): string {
-  return [
-    `Käytetty hakutermi: ${searchTerm}`,
-    stories.length > 0 ? formatStoryList(stories, count) : "En löytänyt hakutuloksia tällä haulla.",
-    'Voit tarkentaa jatkossa esimerkiksi: "tarkenna hakua lisäämällä Helsinki".',
-  ].join("\n\n");
-}
-
 export class ScoutAgent extends Agent<Env> {
   async fetchLatestStories(limit = 12): Promise<Story[]> {
     return fetchLatestStoriesFromYle(limit);
-  }
-
-  async searchNews(query: string, limit = 5): Promise<Story[]> {
-    return searchNewsFromYle(query, limit);
   }
 }
 
 export class TelegramAgent extends Agent<Env, TelegramAgentState> {
   initialState: TelegramAgentState = {
-    lastSearchTerm: null,
     lastResultSummary: null,
     lastCategories: [],
     lastCount: 3,
@@ -549,14 +485,17 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
     const fallback = this.parseIntentHeuristically(text);
     const prompt = [
       "Tunnista käyttäjän uutispyynnön intentio ja palauta VAIN kelvollinen JSON.",
-      "Sallitut action-arvot: help, categories, category_news, search, refine_search.",
-      "Palauta myös count (1-8), categories (taulukko avaimista: politiikka, talous, teknologia, urheilu, kulttuuri, turvallisuus, maailma, tiede), searchTerm ja refineText tarvittaessa.",
+      "Sallitut action-arvot: help, categories, category_news, latest_news, unsupported_search.",
+      "Palauta myös count (1-8) ja categories (taulukko avaimista: politiikka, talous, kulttuuri, tiede, urheilu) tarvittaessa.",
       "Valitse categories, jos käyttäjä kysyy käytettävissä olevia kategorioita.",
-      "Valitse search, jos käyttäjä haluaa hakea uutisia millä tahansa hakusanalla.",
-      "Valitse refine_search, jos käyttäjä haluaa tarkentaa edellistä hakua kuten 'tarkenna' tai 'lisää mukaan'.",
+      "Valitse category_news, jos käyttäjä pyytää uutisia jostain tuetusta kategoriasta.",
+      "Valitse latest_news, jos käyttäjä pyytää uusimpia uutisia ilman kategoriaa.",
+      "Valitse unsupported_search, jos käyttäjä haluaa vapaan hakusanan tai yleishaun.",
       `Käyttäjän viesti: ${text}`,
       `Varafallback JSON: ${JSON.stringify(fallback)}`,
-    ].join("\n\n");
+    ].join("
+
+");
 
     try {
       const result = await generateText({
@@ -564,36 +503,35 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
         prompt,
       });
       const parsed = parseModelJson(result.text) as ParsedTelegramIntent;
-      const resolved = {
-        action: parsed.action || fallback.action,
+      const parsedCategories = normalizeRequestedCategories(parsed.categories);
+      const categories = parsedCategories.length > 0 ? parsedCategories : fallback.categories;
+      const action = parsed.action || fallback.action;
+      if (categories && categories.length > 0 && (action === "help" || action === "latest_news" || action === "category_news")) {
+        return {
+          action: "category_news",
+          count: clampCount(parsed.count, fallback.count),
+          categories,
+        };
+      }
+      return {
+        action,
         count: clampCount(parsed.count, fallback.count),
-        categories: normalizeRequestedCategories(parsed.categories),
-        searchTerm: parsed.searchTerm?.trim(),
-        refineText: parsed.refineText?.trim(),
+        categories,
       };
-      logDebug("telegram.intent.model", { text, fallback, parsed, resolved });
-      return resolved;
-    } catch (error) {
-      logDebug("telegram.intent.fallback", { text, fallback, error: error instanceof Error ? error.message : String(error) });
+    } catch {
       return fallback;
     }
   }
 
   private parseIntentHeuristically(text: string): ParsedTelegramIntent {
-    const normalized = text.toLowerCase();
-    const countMatch = normalized.match(/\b([1-8])\b/);
+    const normalized = normalizeFinnishText(text)
+      .replace(/([a-zåäö])(uutis[a-zåäö]*)/g, "$1 $2")
+      .replace(/([a-zåäö])(uut[a-zåäö]*)/g, "$1 $2");
+    const countMatch = normalized.match(/([1-8])/);
     const count = clampCount(countMatch ? Number(countMatch[1]) : undefined, this.state.lastCount || 3);
 
     if (normalized.includes("kategoria") || normalized.includes("category") || normalized.includes("mitä aiheita")) {
       return { action: "categories", count };
-    }
-
-    if (normalized.includes("tarkenna") || normalized.includes("refine") || normalized.includes("lisää mukaan")) {
-      return {
-        action: "refine_search",
-        count,
-        refineText: text.replace(/^(tarkenna hakua|tarkenna|refine search|refine|lisää mukaan)\s*/i, "").trim(),
-      };
     }
 
     const categories = normalizeRequestedCategories(
@@ -603,13 +541,19 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
       }).map((category) => category.key),
     );
 
-    if (normalized.includes("etsi") || normalized.includes("hae") || normalized.includes("search")) {
-      const searchTerm = text.replace(/^(etsi|hae|search)\s+/i, "").trim();
-      return { action: "search", count, categories, searchTerm: searchTerm || text.trim() };
+    if (normalized.includes("etsi") || normalized.includes("hae") || normalized.includes("search") || normalized.includes("hakusana")) {
+      if (categories.length > 0) {
+        return { action: "category_news", count, categories };
+      }
+      return { action: "unsupported_search", count };
     }
 
-    if (categories.length > 0 || normalized.includes("uusin") || normalized.includes("latest") || normalized.includes("uuti")) {
+    if (categories.length > 0) {
       return { action: "category_news", count, categories };
+    }
+
+    if (normalized.includes("uusin") || normalized.includes("uusinta") || normalized.includes("latest") || normalized.includes("tuoreimmat") || normalized.includes("uuti")) {
+      return { action: "latest_news", count };
     }
 
     return { action: "help", count };
@@ -622,66 +566,48 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
       return categoriesHelpText();
     }
 
-    if (intent.action === "category_news") {
-      const categories = intent.categories && intent.categories.length > 0 ? intent.categories : this.state.lastCategories;
-      const count = clampCount(intent.count, this.state.lastCount || 3);
-      const stories = categories.length > 0 ? await fetchStoriesByCategories(categories, Math.max(count, 8)) : await fetchLatestStoriesFromYle(20);
-      const filtered = categories.length > 0
-        ? stories.filter((story) => categories.includes(story.category || "yleinen") || !YLE_RSS_BY_CATEGORY[story.category || "yleinen"])
-        : stories;
-      logDebug("telegram.category_news", {
-        text,
-        categories,
-        requestedCount: count,
-        fetchedCount: stories.length,
-        filteredCount: filtered.length,
-        sample: filtered.slice(0, 5).map((story) => ({ title: story.title, category: story.category, pubDate: story.pubDate, link: story.link })),
-      });
+    if (intent.action === "unsupported_search") {
+      return [
+        "Vapaa hakusana ei ole käytössä tässä versiossa.",
+        "Voit pyytää uutisia vain tuetuista RSS-kategorioista: talous, politiikka, kulttuuri, tiede, urheilu.",
+        'Esimerkki: "Anna 3 uusinta talousuutista"',
+      ].join("
 
-      this.setState({
-        ...this.state,
-        lastCategories: categories,
-        lastCount: count,
-        lastResultSummary: `Kategoriauutiset: ${categories.join(", ") || "yleinen"}`,
-      });
-
-      const heading = categories.length > 0
-        ? `Tässä ${count} uusinta uutista kategorioista: ${categories.join(", ")}`
-        : `Tässä ${count} uusinta Ylen uutista`;
-
-      return [heading, formatStoryList(filtered, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("\n\n");
+");
     }
 
     const count = clampCount(intent.count, this.state.lastCount || 3);
-    let searchTerm = intent.searchTerm?.trim();
 
-    if (intent.action === "refine_search") {
-      if (!this.state.lastSearchTerm) {
-        return 'Minulla ei ole vielä aiempaa hakua tarkennettavaksi. Aloita esimerkiksi: "Hae uutisia hakusanalla datakeskus".';
-      }
-      searchTerm = `${this.state.lastSearchTerm} ${intent.refineText || ""}`.trim();
+    if (intent.action === "latest_news") {
+      const stories = await fetchLatestStoriesFromYle(count);
+      this.setState({
+        ...this.state,
+        lastCategories: [],
+        lastCount: count,
+        lastResultSummary: "Uusimmat uutiset",
+      });
+      return [`Tässä ${count} uusinta Ylen uutista`, formatStoryList(stories, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("
+
+");
     }
 
-    if (!searchTerm) {
-      return 'En saanut hakutermiä talteen. Kokeile esimerkiksi: "Hae uutisia hakusanalla merituulivoima".';
-    }
+    const categories = intent.categories && intent.categories.length > 0 ? intent.categories : this.state.lastCategories;
+    const stories = await fetchStoriesByCategories(categories, count);
 
-    const stories = await searchNewsFromYle(searchTerm, count);
-    logDebug("telegram.search", {
-      text,
-      action: intent.action,
-      searchTerm,
-      count,
-      resultCount: stories.length,
-      sample: stories.slice(0, 5).map((story) => ({ title: story.title, category: story.category, pubDate: story.pubDate, link: story.link })),
-    });
     this.setState({
       ...this.state,
-      lastSearchTerm: searchTerm,
+      lastCategories: categories,
       lastCount: count,
-      lastResultSummary: `Hakutermi: ${searchTerm}`,
+      lastResultSummary: `Kategoriauutiset: ${categories.join(", ") || "yleinen"}`,
     });
-    return formatSearchResponse(searchTerm, stories, count);
+
+    const heading = categories.length > 0
+      ? `Tässä ${count} uusinta uutista kategorioista: ${categories.join(", ")}`
+      : `Tässä ${count} uusinta Ylen uutista`;
+
+    return [heading, formatStoryList(stories, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("
+
+");
   }
 }
 
@@ -975,56 +901,6 @@ export default {
       return handleTelegramWebhook(request, env);
     }
 
-
-    if (url.pathname === "/api/debug-search" && request.method === "GET") {
-      const q = url.searchParams.get("q")?.trim() || "";
-      const categoryParams = [url.searchParams.get("category"), ...url.searchParams.getAll("category")].filter(Boolean) as string[];
-      const categories = normalizeRequestedCategories(categoryParams);
-      const count = clampCount(url.searchParams.get("count") ? Number(url.searchParams.get("count")) : undefined, 5);
-      const latest = await fetchLatestStoriesFromYle(20);
-      const categoryStories = categories.length > 0 ? await fetchStoriesByCategories(categories, Math.max(count, 8)) : [];
-      const searchStories = q ? await searchNewsFromYle(q, count) : [];
-      return json({
-        ok: true,
-        latestFeed: YLE_RSS_URL,
-        query: q,
-        requestedCategory: categories,
-        latestCount: latest.length,
-        latestSample: latest.slice(0, 5).map((story) => ({ title: story.title, pubDate: story.pubDate, link: story.link, category: story.category })),
-        categoryCount: categoryStories.length,
-        categorySample: categoryStories.slice(0, 5).map((story) => ({ title: story.title, pubDate: story.pubDate, link: story.link, category: story.category })),
-        searchCount: searchStories.length,
-        searchSample: searchStories.slice(0, 5).map((story) => ({ title: story.title, pubDate: story.pubDate, link: story.link, category: story.category })),
-      });
-    }
-
-    if (url.pathname === "/api/debug-feed" && request.method === "GET") {
-      const feedUrl = url.searchParams.get("url")?.trim() || YLE_RSS_URL;
-      try {
-        const response = await fetch(feedUrl, {
-          headers: {
-            "user-agent": "ylesignal/1.0",
-            "accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
-          },
-          redirect: "follow",
-        });
-        const body = await response.text();
-        const parsed = parseRss(body);
-        return json({
-          ok: true,
-          feedUrl,
-          finalUrl: response.url,
-          status: response.status,
-          contentType: response.headers.get("content-type"),
-          preview: previewText(body, 800),
-          parsedCount: parsed.length,
-          firstItems: parsed.slice(0, 5).map((story) => ({ title: story.title, pubDate: story.pubDate, link: story.link, category: story.category })),
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return json({ ok: false, error: message, feedUrl }, 500);
-      }
-    }
     if (url.pathname === "/api/bootstrap" && request.method === "POST") {
       const agent = await getBriefingAgent(env);
       return json({ ok: true, status: await agent.getStatus() });
