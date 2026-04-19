@@ -532,6 +532,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
     } catch {
       return fallback;
     }
+  }
 
   private parseIntentHeuristically(text: string): ParsedTelegramIntent {
     const normalized = text.toLowerCase();
