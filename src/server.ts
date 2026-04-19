@@ -4,7 +4,7 @@ import { generateText } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 
 const APP_AGENT_NAME = "yle-signal";
-const YLE_RSS_URL = "https://yle.fi/rss/t/18-219200/en";
+const YLE_RSS_URL = "https://yle.fi/rss/uutiset/tuoreimmat";
 
 type Story = {
   title: string;
@@ -82,11 +82,63 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+function parseModelJson(text: string) {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const candidate = fenced ? fenced[1].trim() : trimmed;
+  return JSON.parse(candidate);
+}
+
+function fallbackDigest(stories: Story[]): Omit<DailyDigest, "generatedAt" | "source"> {
+  const topStories: DigestStory[] = stories.slice(0, 3).map((story) => ({
+    title: story.title,
+    link: story.link,
+    pubDate: story.pubDate,
+    category: "uutiset",
+    whyItMatters: "Tämä on yksi Ylen uusimmista uutisista ja sitä kannattaa seurata päivän aikana.",
+  }));
+
+  return {
+    headline: "Yle Signal: tuoreimmat uutiset",
+    summary: `Kooste sisältää ${topStories.length} tuoretta Ylen uutista nopeaa katselua varten.`,
+    watchNext: "Seuraa, nouseeko jokin näistä aiheista päivän pääuutiseksi tai jatkuvaksi seurannaksi.",
+    stories: topStories,
+  };
+}
+
+function normalizeDigestStory(story: Partial<DigestStory>, fallback: Story): DigestStory {
+  return {
+    title: story.title || fallback.title,
+    link: story.link || fallback.link,
+    pubDate: story.pubDate || fallback.pubDate,
+    category: story.category || "uutiset",
+    whyItMatters:
+      story.whyItMatters || "Tämä on yksi Ylen uusimmista uutisista ja sitä kannattaa seurata päivän aikana.",
+  };
+}
+
+function normalizeDigest(
+  parsed: Partial<Omit<DailyDigest, "generatedAt" | "source">>,
+  selected: Story[],
+): Omit<DailyDigest, "generatedAt" | "source"> {
+  const fallback = fallbackDigest(selected);
+  const mappedStories = Array.isArray(parsed.stories)
+    ? parsed.stories.slice(0, 3).map((story, index) => normalizeDigestStory(story, selected[index] || selected[0]))
+    : fallback.stories;
+
+  return {
+    headline: parsed.headline || fallback.headline,
+    summary: parsed.summary || fallback.summary,
+    watchNext: parsed.watchNext || fallback.watchNext,
+    stories: mappedStories.length > 0 ? mappedStories : fallback.stories,
+  };
+}
+
 export class ScoutAgent extends Agent<Env> {
   async fetchLatestStories(limit = 12): Promise<Story[]> {
     const response = await fetch(YLE_RSS_URL, {
       headers: {
-        "user-agent": "yle-signal-demo/0.1",
+        "user-agent": "yle-signal-demo/0.2",
       },
     });
 
@@ -116,7 +168,7 @@ export class BriefingAgent extends Think<Env, BriefingState> {
   getSystemPrompt(): string {
     const digest = this.state.latestDigest;
     return [
-      "You are Yle Signal, a concise analyst that explains the latest Yle English news.",
+      "You are Yle Signal, a concise analyst that explains the latest Yle news in Finnish.",
       "Only use the stored digest below. If the user asks about something not present, say so clearly.",
       digest
         ? `Latest digest JSON: ${JSON.stringify(digest)}`
@@ -144,20 +196,30 @@ export class BriefingAgent extends Think<Env, BriefingState> {
       const selected = unseenStories.length > 0 ? unseenStories : stories.slice(0, 5);
 
       const prompt = [
-        "Create a compact JSON briefing from the latest Yle News in English stories.",
-        "Return strictly valid JSON with keys: headline, summary, watchNext, stories.",
-        "stories must be an array of up to 3 objects with keys: title, link, whyItMatters, category, pubDate.",
-        "Keep the tone factual and practical. Keep whyItMatters to one sentence each.",
+        "Laadi tiivis JSON-muotoinen uutiskatsaus Ylen uusimmista suomenkielisistä uutisista.",
+        "Palauta VAIN kelvollinen JSON. Älä käytä markdownia. Älä käytä koodiaitoja. Älä lisää selitystekstiä.",
+        "Pakolliset avaimet: headline, summary, watchNext, stories.",
+        "stories saa sisältää enintään 3 kohdetta. Jokaisessa kohteessa avaimet: title, link, whyItMatters, category, pubDate.",
+        "Kirjoita kaikki arvot suomeksi paitsi linkit.",
+        "Pidä tyyli asiallisena ja käytännöllisenä. whyItMatters saa olla vain yksi virke.",
         "Input stories:",
         JSON.stringify(selected),
       ].join("\n\n");
 
-      const result = await generateText({
-        model: this.getModel(),
-        prompt,
-      });
+      let parsed: Omit<DailyDigest, "generatedAt" | "source">;
 
-      const parsed = JSON.parse(result.text) as Omit<DailyDigest, "generatedAt" | "source">;
+      try {
+        const result = await generateText({
+          model: this.getModel(),
+          prompt,
+        });
+
+        parsed = normalizeDigest(parseModelJson(result.text), selected);
+      } catch (modelError) {
+        console.error("Model generation failed, using fallback digest", modelError);
+        parsed = fallbackDigest(selected);
+      }
+
       const digest: DailyDigest = {
         generatedAt: new Date().toISOString(),
         source: YLE_RSS_URL,
@@ -235,8 +297,14 @@ export default {
 
     if (url.pathname === "/api/refresh" && request.method === "POST") {
       const agent = await getBriefingAgent(env);
-      const digest = await agent.generateDigestNow();
-      return json({ ok: true, digest });
+
+      try {
+        const digest = await agent.generateDigestNow();
+        return json({ ok: true, digest });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ ok: false, error: message }, 500);
+      }
     }
 
     if (url.pathname === "/api/bootstrap" && request.method === "POST") {

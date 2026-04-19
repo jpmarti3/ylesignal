@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="fi">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -72,22 +72,22 @@
     <main>
       <div class="card">
         <h1>Yle Signal</h1>
-        <p class="muted">A lightweight two-agent Cloudflare demo that turns the latest Yle English headlines into a morning briefing.</p>
+        <p class="muted">Kevyt kahden agentin Cloudflare-demo, joka tekee Ylen tuoreimmista suomenkielisistä uutisista tiiviin katsauksen.</p>
         <div class="row">
-          <button id="refreshBtn">Generate digest now</button>
-          <button id="historyBtn" class="secondary">Load history</button>
-          <span id="statusText" class="muted">Bootstrapping…</span>
+          <button id="refreshBtn">Luo katsaus nyt</button>
+          <button id="historyBtn" class="secondary">Lataa historia</button>
+          <span id="statusText" class="muted">Käynnistetään…</span>
         </div>
       </div>
 
       <section id="digestCard" class="card">
-        <h2>Latest digest</h2>
-        <div id="digestContent" class="muted">No digest yet.</div>
+        <h2>Uusin katsaus</h2>
+        <div id="digestContent" class="muted">Katsausta ei vielä ole.</div>
       </section>
 
       <section id="historyCard" class="card" hidden>
-        <h2>Recent digests</h2>
-        <div id="historyContent" class="muted">History has not been loaded yet.</div>
+        <h2>Aiemmat katsaukset</h2>
+        <div id="historyContent" class="muted">Historiaa ei ole vielä ladattu.</div>
       </section>
     </main>
 
@@ -108,7 +108,7 @@
 
       function renderDigest(payload) {
         if (!payload || !payload.digest) {
-          digestContent.innerHTML = '<p class="muted">No digest available yet. Click “Generate digest now”.</p>';
+          digestContent.innerHTML = '<p class="muted">Katsausta ei ole vielä saatavilla. Paina “Luo katsaus nyt”.</p>';
           return;
         }
 
@@ -117,26 +117,26 @@
           .map((story) => `
             <li>
               <a href="${escapeHtml(story.link)}" target="_blank" rel="noreferrer">${escapeHtml(story.title)}</a>
-              <span class="pill">${escapeHtml(story.category || "general")}</span>
+              <span class="pill">${escapeHtml(story.category || "uutiset")}</span>
               <div>${escapeHtml(story.whyItMatters || "")}</div>
             </li>
           `)
           .join("");
 
         digestContent.innerHTML = `
-          <p class="muted">Generated: ${escapeHtml(digest.generatedAt)}</p>
-          <h3>${escapeHtml(digest.headline || "Daily briefing")}</h3>
+          <p class="muted">Luotu: ${escapeHtml(digest.generatedAt)}</p>
+          <h3>${escapeHtml(digest.headline || "Päivän katsaus")}</h3>
           <p>${escapeHtml(digest.summary || "")}</p>
-          <p><strong>Watch next:</strong> ${escapeHtml(digest.watchNext || "")}</p>
+          <p><strong>Seuraa seuraavaksi:</strong> ${escapeHtml(digest.watchNext || "")}</p>
           <ul>${storyHtml}</ul>
         `;
       }
 
       function renderStatus(payload) {
         const status = payload?.status?.status || "idle";
-        const lastRunAt = payload?.status?.lastRunAt || "never";
+        const lastRunAt = payload?.status?.lastRunAt || "ei koskaan";
         const lastError = payload?.status?.lastError;
-        statusText.textContent = `Status: ${status}. Last run: ${lastRunAt}${lastError ? ` · Error: ${lastError}` : ""}`;
+        statusText.textContent = `Tila: ${status}. Viimeisin ajo: ${lastRunAt}${lastError ? ` · Virhe: ${lastError}` : ""}`;
       }
 
       async function loadLatest() {
@@ -147,16 +147,38 @@
       }
 
       async function bootstrap() {
-        await fetch("/api/bootstrap", { method: "POST" });
+        const response = await fetch("/api/bootstrap", { method: "POST" });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || payload.ok === false) {
+          throw new Error(payload.error || `Bootstrap failed with ${response.status}`);
+        }
         await loadLatest();
       }
 
       async function generateNow() {
-        statusText.textContent = "Generating digest…";
-        const response = await fetch("/api/refresh", { method: "POST" });
-        const payload = await response.json();
-        renderDigest({ digest: payload.digest, status: { status: "idle", lastRunAt: payload.digest?.generatedAt || new Date().toISOString(), lastError: null } });
-        await loadLatest();
+        statusText.textContent = "Luodaan katsausta…";
+
+        try {
+          const response = await fetch("/api/refresh", { method: "POST" });
+          const payload = await response.json().catch(() => ({}));
+
+          if (!response.ok || payload.ok === false) {
+            throw new Error(payload.error || `Request failed with ${response.status}`);
+          }
+
+          renderDigest({
+            digest: payload.digest,
+            status: {
+              status: "idle",
+              lastRunAt: payload.digest?.generatedAt || new Date().toISOString(),
+              lastError: null,
+            },
+          });
+          await loadLatest();
+          statusText.textContent = "Katsaus luotu.";
+        } catch (error) {
+          statusText.textContent = `Katsauksen luonti epäonnistui: ${error.message}`;
+        }
       }
 
       async function loadHistory() {
@@ -172,14 +194,14 @@
                 <div>${escapeHtml(item.summary)}</div>
               </article>
             `).join("")
-          : '<p class="muted">No history yet.</p>';
+          : '<p class="muted">Historiaa ei vielä ole.</p>';
       }
 
       document.getElementById("refreshBtn").addEventListener("click", generateNow);
       document.getElementById("historyBtn").addEventListener("click", loadHistory);
 
       bootstrap().catch((error) => {
-        statusText.textContent = `Failed to load app: ${error.message}`;
+        statusText.textContent = `Sovelluksen lataus epäonnistui: ${error.message}`;
       });
     </script>
   </body>
