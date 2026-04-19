@@ -529,16 +529,9 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
       };
       logDebug("telegram.intent.model", { text, fallback, parsed, resolved });
       return resolved;
-        action: parsed.action || fallback.action,
-        count: clampCount(parsed.count, fallback.count),
-        categories: normalizeRequestedCategories(parsed.categories),
-        searchTerm: parsed.searchTerm?.trim(),
-        refineText: parsed.refineText?.trim(),
-      };
     } catch {
       return fallback;
     }
-  }
 
   private parseIntentHeuristically(text: string): ParsedTelegramIntent {
     const normalized = text.toLowerCase();
