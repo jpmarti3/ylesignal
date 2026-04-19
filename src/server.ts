@@ -231,6 +231,14 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+function logDebug(event: string, data: Record<string, unknown>) {
+  console.log(`${event} ${JSON.stringify(data)}`);
+}
+
+function previewText(value: string, length = 240): string {
+  return value.replace(/\s+/g, ' ').trim().slice(0, length);
+}
+
 function parseModelJson(text: string) {
   const trimmed = text.trim();
   const fenced = trimmed.match(/^```(?:json)?\s*([\\s\\S]*?)\s*```$/i);
@@ -409,6 +417,7 @@ function formatStoryList(stories: Story[], count: number): string {
 
 
 async function fetchStoriesFromFeed(feedUrl: string, limit = 12): Promise<Story[]> {
+  logDebug("rss.fetch.start", { feedUrl, limit });
   const response = await fetch(feedUrl, {
     headers: {
       "user-agent": "ylesignal/1.0",
@@ -417,17 +426,34 @@ async function fetchStoriesFromFeed(feedUrl: string, limit = 12): Promise<Story[
     redirect: "follow",
   });
 
+  const xml = await response.text();
+  logDebug("rss.fetch.response", {
+    feedUrl,
+    status: response.status,
+    ok: response.ok,
+    finalUrl: response.url,
+    contentType: response.headers.get("content-type"),
+    preview: previewText(xml, 500),
+  });
+
   if (!response.ok) {
     throw new Error(`Yle RSS request failed with ${response.status} for ${feedUrl}`);
   }
 
-  const xml = await response.text();
-  const stories = parseRss(xml).slice(0, limit);
-  if (stories.length === 0) {
-    console.log("rss.empty", JSON.stringify({ feedUrl, status: response.status, contentType: response.headers.get("content-type"), preview: xml.slice(0, 300) }));
-  } else {
-    console.log("rss.ok", JSON.stringify({ feedUrl, count: stories.length, firstTitle: stories[0]?.title }));
-  }
+  const allStories = parseRss(xml);
+  const stories = allStories.slice(0, limit);
+  logDebug("rss.parse.result", {
+    feedUrl,
+    parsedCount: allStories.length,
+    returnedCount: stories.length,
+    firstThree: stories.slice(0, 3).map((story) => ({
+      title: story.title,
+      link: story.link,
+      pubDate: story.pubDate,
+      category: story.category,
+    })),
+  });
+
   return stories;
 }
 
@@ -437,16 +463,30 @@ async function fetchLatestStoriesFromYle(limit = 12): Promise<Story[]> {
 
 async function fetchStoriesByCategories(categories: string[], limit = 12): Promise<Story[]> {
   const normalized = normalizeRequestedCategories(categories);
+  logDebug("rss.category.request", { categories, normalized, limit });
   if (normalized.length === 0) return fetchLatestStoriesFromYle(limit);
 
   const feeds = Array.from(new Set(normalized.map((c) => YLE_RSS_BY_CATEGORY[c]).filter(Boolean)));
+  logDebug("rss.category.feeds", { normalized, feeds });
   if (feeds.length === 0) {
     const latest = await fetchLatestStoriesFromYle(Math.max(limit * 3, 24));
-    return latest.filter((story) => normalized.includes(story.category || "yleinen")).slice(0, limit);
+    const filtered = latest.filter((story) => normalized.includes(story.category || "yleinen")).slice(0, limit);
+    logDebug("rss.category.filtered_latest", {
+      normalized,
+      latestCount: latest.length,
+      filteredCount: filtered.length,
+      sample: filtered.slice(0, 5).map((story) => ({ title: story.title, category: story.category, pubDate: story.pubDate, link: story.link })),
+    });
+    return filtered;
   }
 
   const perFeed = Math.max(limit, 8);
   const collected = (await Promise.all(feeds.map((feed) => fetchStoriesFromFeed(feed, perFeed)))).flat();
+  logDebug("rss.category.collected", {
+    normalized,
+    collectedCount: collected.length,
+    sample: collected.slice(0, 5).map((story) => ({ title: story.title, category: story.category, pubDate: story.pubDate, link: story.link })),
+  });
   const deduped: Story[] = [];
   const seen = new Set<string>();
   for (const story of collected) {
@@ -463,8 +503,15 @@ async function fetchStoriesByCategories(categories: string[], limit = 12): Promi
 
 async function searchNewsFromYle(query: string, limit = 5): Promise<Story[]> {
   const corpus = await fetchLatestStoriesFromYle(80);
+  const terms = tokenizeSearchTerm(query);
   const ranked = rankStoriesBySearch(corpus, query);
-  console.log("rss.search", JSON.stringify({ query, corpus: corpus.length, matched: ranked.length }));
+  logDebug("rss.search", {
+    query,
+    terms,
+    corpus: corpus.length,
+    matched: ranked.length,
+    sample: ranked.slice(0, 5).map((story) => ({ title: story.title, pubDate: story.pubDate, link: story.link, category: story.category })),
+  });
   return ranked.slice(0, limit);
 }
 
@@ -517,14 +564,17 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
         prompt,
       });
       const parsed = parseModelJson(result.text) as ParsedTelegramIntent;
-      return {
+      const resolved = {
         action: parsed.action || fallback.action,
         count: clampCount(parsed.count, fallback.count),
         categories: normalizeRequestedCategories(parsed.categories),
         searchTerm: parsed.searchTerm?.trim(),
         refineText: parsed.refineText?.trim(),
       };
-    } catch {
+      logDebug("telegram.intent.model", { text, fallback, parsed, resolved });
+      return resolved;
+    } catch (error) {
+      logDebug("telegram.intent.fallback", { text, fallback, error: error instanceof Error ? error.message : String(error) });
       return fallback;
     }
   }
@@ -573,12 +623,20 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
     }
 
     if (intent.action === "category_news") {
-      const stories = await fetchLatestStoriesFromYle(20);
       const categories = intent.categories && intent.categories.length > 0 ? intent.categories : this.state.lastCategories;
       const count = clampCount(intent.count, this.state.lastCount || 3);
+      const stories = categories.length > 0 ? await fetchStoriesByCategories(categories, Math.max(count, 8)) : await fetchLatestStoriesFromYle(20);
       const filtered = categories.length > 0
-        ? stories.filter((story) => categories.includes(story.category || "yleinen"))
+        ? stories.filter((story) => categories.includes(story.category || "yleinen") || !YLE_RSS_BY_CATEGORY[story.category || "yleinen"])
         : stories;
+      logDebug("telegram.category_news", {
+        text,
+        categories,
+        requestedCount: count,
+        fetchedCount: stories.length,
+        filteredCount: filtered.length,
+        sample: filtered.slice(0, 5).map((story) => ({ title: story.title, category: story.category, pubDate: story.pubDate, link: story.link })),
+      });
 
       this.setState({
         ...this.state,
@@ -609,6 +667,14 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
     }
 
     const stories = await searchNewsFromYle(searchTerm, count);
+    logDebug("telegram.search", {
+      text,
+      action: intent.action,
+      searchTerm,
+      count,
+      resultCount: stories.length,
+      sample: stories.slice(0, 5).map((story) => ({ title: story.title, category: story.category, pubDate: story.pubDate, link: story.link })),
+    });
     this.setState({
       ...this.state,
       lastSearchTerm: searchTerm,
@@ -909,6 +975,56 @@ export default {
       return handleTelegramWebhook(request, env);
     }
 
+
+    if (url.pathname === "/api/debug-search" && request.method === "GET") {
+      const q = url.searchParams.get("q")?.trim() || "";
+      const categoryParams = [url.searchParams.get("category"), ...url.searchParams.getAll("category")].filter(Boolean) as string[];
+      const categories = normalizeRequestedCategories(categoryParams);
+      const count = clampCount(url.searchParams.get("count") ? Number(url.searchParams.get("count")) : undefined, 5);
+      const latest = await fetchLatestStoriesFromYle(20);
+      const categoryStories = categories.length > 0 ? await fetchStoriesByCategories(categories, Math.max(count, 8)) : [];
+      const searchStories = q ? await searchNewsFromYle(q, count) : [];
+      return json({
+        ok: true,
+        latestFeed: YLE_RSS_URL,
+        query: q,
+        requestedCategory: categories,
+        latestCount: latest.length,
+        latestSample: latest.slice(0, 5).map((story) => ({ title: story.title, pubDate: story.pubDate, link: story.link, category: story.category })),
+        categoryCount: categoryStories.length,
+        categorySample: categoryStories.slice(0, 5).map((story) => ({ title: story.title, pubDate: story.pubDate, link: story.link, category: story.category })),
+        searchCount: searchStories.length,
+        searchSample: searchStories.slice(0, 5).map((story) => ({ title: story.title, pubDate: story.pubDate, link: story.link, category: story.category })),
+      });
+    }
+
+    if (url.pathname === "/api/debug-feed" && request.method === "GET") {
+      const feedUrl = url.searchParams.get("url")?.trim() || YLE_RSS_URL;
+      try {
+        const response = await fetch(feedUrl, {
+          headers: {
+            "user-agent": "ylesignal/1.0",
+            "accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+          },
+          redirect: "follow",
+        });
+        const body = await response.text();
+        const parsed = parseRss(body);
+        return json({
+          ok: true,
+          feedUrl,
+          finalUrl: response.url,
+          status: response.status,
+          contentType: response.headers.get("content-type"),
+          preview: previewText(body, 800),
+          parsedCount: parsed.length,
+          firstItems: parsed.slice(0, 5).map((story) => ({ title: story.title, pubDate: story.pubDate, link: story.link, category: story.category })),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ ok: false, error: message, feedUrl }, 500);
+      }
+    }
     if (url.pathname === "/api/bootstrap" && request.method === "POST") {
       const agent = await getBriefingAgent(env);
       return json({ ok: true, status: await agent.getStatus() });
