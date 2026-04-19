@@ -3,7 +3,7 @@ import { Think } from "@cloudflare/think";
 import { generateText } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 
-const APP_AGENT_NAME = "yle-signal";
+const APP_AGENT_NAME = "ylesignal";
 const YLE_RSS_URL = "https://yle.fi/rss/uutiset/tuoreimmat";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 
@@ -19,6 +19,14 @@ const CATEGORY_DEFINITIONS = [
 ] as const;
 
 const CATEGORY_KEYS = new Set(CATEGORY_DEFINITIONS.map((category) => category.key));
+
+function logDebug(event: string, details: Record<string, unknown>) {
+  try {
+    console.log(`[ylesignal] ${event}`, JSON.stringify(details));
+  } catch {
+    console.log(`[ylesignal] ${event}`, details);
+  }
+}
 
 type CategoryKey = (typeof CATEGORY_DEFINITIONS)[number]["key"] | "yleinen";
 
@@ -151,7 +159,7 @@ function classifyCategory(text: string, rssCategories: string[] = []): CategoryK
 
 function parseRss(xml: string): Story[] {
   const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
-  return items
+  const stories = items
     .map((match) => {
       const item = match[1];
       const title = matchTag(item, "title");
@@ -166,6 +174,21 @@ function parseRss(xml: string): Story[] {
       } satisfies Story;
     })
     .filter((item) => item.title && item.link);
+
+  const categoryCounts = stories.reduce<Record<string, number>>((acc, story) => {
+    const key = story.category || "yleinen";
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+
+  logDebug("rss.parsed", {
+    itemCount: items.length,
+    storyCount: stories.length,
+    categoryCounts,
+    sampleTitles: stories.slice(0, 5).map((story) => ({ title: story.title, category: story.category })),
+  });
+
+  return stories;
 }
 
 function tokenizeSearchTerm(query: string): string[] {
@@ -204,13 +227,29 @@ function scoreStoryForSearch(story: Story, terms: string[]): number {
 
 function rankStoriesBySearch(stories: Story[], query: string): Story[] {
   const terms = tokenizeSearchTerm(query);
-  if (terms.length === 0) return [];
+  if (terms.length === 0) {
+    logDebug("search.rank.empty_terms", { query });
+    return [];
+  }
 
-  return stories
+  const ranked = stories
     .map((story, index) => ({ story, score: scoreStoryForSearch(story, terms), index }))
     .filter((entry) => entry.score > 0)
-    .sort((a, b) => b.score - a.score || a.index - b.index)
-    .map((entry) => entry.story);
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+
+  logDebug("search.rank", {
+    query,
+    terms,
+    corpusSize: stories.length,
+    matchCount: ranked.length,
+    topMatches: ranked.slice(0, 8).map((entry) => ({
+      title: entry.story.title,
+      category: entry.story.category,
+      score: entry.score,
+    })),
+  });
+
+  return ranked.map((entry) => entry.story);
 }
 
 function json(data: unknown, status = 200): Response {
@@ -401,6 +440,7 @@ function formatStoryList(stories: Story[], count: number): string {
 
 
 async function fetchLatestStoriesFromYle(limit = 12): Promise<Story[]> {
+  logDebug("rss.fetch.start", { url: YLE_RSS_URL, limit });
   const response = await fetch(YLE_RSS_URL, {
     headers: {
       "user-agent": "yle-signal-demo/0.5",
@@ -412,13 +452,23 @@ async function fetchLatestStoriesFromYle(limit = 12): Promise<Story[]> {
   }
 
   const xml = await response.text();
-  return parseRss(xml).slice(0, limit);
+  const stories = parseRss(xml).slice(0, limit);
+  logDebug("rss.fetch.done", { limit, returned: stories.length, sample: stories.slice(0, 5).map((story) => ({ title: story.title, category: story.category })) });
+  return stories;
 }
 
 async function searchNewsFromYle(query: string, limit = 5): Promise<Story[]> {
   const corpus = await fetchLatestStoriesFromYle(60);
   const ranked = rankStoriesBySearch(corpus, query);
-  return ranked.slice(0, limit);
+  const result = ranked.slice(0, limit);
+  logDebug("search.execute", {
+    query,
+    limit,
+    corpusSize: corpus.length,
+    resultCount: result.length,
+    results: result.map((story) => ({ title: story.title, category: story.category })),
+  });
+  return result;
 }
 
 function formatSearchResponse(searchTerm: string, stories: Story[], count: number): string {
@@ -470,7 +520,15 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
         prompt,
       });
       const parsed = parseModelJson(result.text) as ParsedTelegramIntent;
-      return {
+      const resolved = {
+        action: parsed.action || fallback.action,
+        count: clampCount(parsed.count, fallback.count),
+        categories: normalizeRequestedCategories(parsed.categories),
+        searchTerm: parsed.searchTerm?.trim(),
+        refineText: parsed.refineText?.trim(),
+      };
+      logDebug("telegram.intent.model", { text, fallback, parsed, resolved });
+      return resolved;
         action: parsed.action || fallback.action,
         count: clampCount(parsed.count, fallback.count),
         categories: normalizeRequestedCategories(parsed.categories),
@@ -520,6 +578,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
 
   async handleIncomingMessage(text: string): Promise<string> {
     const intent = await this.parseIntent(text);
+    logDebug("telegram.message.received", { text, intent, state: this.state });
 
     if (intent.action === "help" || intent.action === "categories") {
       return categoriesHelpText();
@@ -532,6 +591,15 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
       const filtered = categories.length > 0
         ? stories.filter((story) => categories.includes(story.category || "yleinen"))
         : stories;
+
+      logDebug("telegram.category_news", {
+        requestedCategories: categories,
+        requestedCount: count,
+        totalStories: stories.length,
+        filteredCount: filtered.length,
+        sampleFiltered: filtered.slice(0, 8).map((story) => ({ title: story.title, category: story.category })),
+        sampleAll: stories.slice(0, 8).map((story) => ({ title: story.title, category: story.category })),
+      });
 
       this.setState({
         ...this.state,
@@ -562,6 +630,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
     }
 
     const stories = await searchNewsFromYle(searchTerm, count);
+    logDebug("telegram.search", { searchTerm, count, resultCount: stories.length, results: stories.map((story) => ({ title: story.title, category: story.category })) });
     this.setState({
       ...this.state,
       lastSearchTerm: searchTerm,
@@ -607,6 +676,7 @@ export class BriefingAgent extends Think<Env, BriefingState> {
   }
 
   async buildMorningDigest(payload?: { trigger?: string; sendTelegram?: boolean }): Promise<DailyDigest | null> {
+    logDebug("digest.start", { payload, existingSeenLinks: this.state.seenLinks.length });
     this.setState({
       ...this.state,
       status: "running",
@@ -622,6 +692,7 @@ export class BriefingAgent extends Think<Env, BriefingState> {
       const stories = await scout.fetchLatestStories(10);
       const unseenStories = stories.filter((story) => !this.state.seenLinks.includes(story.link)).slice(0, 5);
       const selected = unseenStories.length > 0 ? unseenStories : stories.slice(0, 5);
+      logDebug("digest.story_selection", { totalStories: stories.length, unseenStories: unseenStories.length, selected: selected.map((story) => ({ title: story.title, category: story.category })) });
 
       const prompt = [
         "Laadi tiivis JSON-muotoinen uutiskatsaus Ylen uusimmista suomenkielisistä uutisista.",
@@ -643,9 +714,11 @@ export class BriefingAgent extends Think<Env, BriefingState> {
         });
 
         parsed = normalizeDigest(parseModelJson(result.text), selected);
+        logDebug("digest.model.success", { headline: parsed.headline, storyCount: parsed.stories.length });
       } catch (modelError) {
         console.error("Model generation failed, using fallback digest", modelError);
         parsed = fallbackDigest(selected);
+        logDebug("digest.model.fallback", { selectedCount: selected.length });
       }
 
       const digest: DailyDigest = {
@@ -666,9 +739,12 @@ export class BriefingAgent extends Think<Env, BriefingState> {
         lastTelegramError: null,
       };
 
+      logDebug("digest.built", { headline: digest.headline, stories: digest.stories.map((story) => ({ title: story.title, category: story.category })) });
+
       if (payload?.sendTelegram !== false && telegramIsConfigured(this.env)) {
         try {
           await sendTelegramMessage(this.env, formatTelegramDigest(digest));
+          logDebug("telegram.delivery.success", { trigger: payload?.trigger || "unknown" });
           delivery = {
             ...delivery,
             lastTelegramAt: new Date().toISOString(),
@@ -681,6 +757,7 @@ export class BriefingAgent extends Think<Env, BriefingState> {
             lastTelegramError: message,
           };
           console.error("Telegram delivery failed", telegramError);
+          logDebug("telegram.delivery.failed", { error: message, trigger: payload?.trigger || "unknown" });
         }
       }
 
@@ -779,6 +856,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 
   const chatId = update?.message?.chat?.id;
   const text = update?.message?.text?.trim();
+  logDebug("telegram.webhook.received", { chatId, text, hasMessage: Boolean(update?.message) });
   if (!chatId || !text) {
     return json({ ok: true, ignored: true });
   }
@@ -786,6 +864,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   try {
     const agent = await getBriefingAgent(env);
     const reply = await agent.handleTelegramChat(String(chatId), text);
+    logDebug("telegram.webhook.reply", { chatId, replyPreview: reply.slice(0, 500) });
     await sendTelegramMessage(env, reply, chatId);
     return json({ ok: true });
   } catch (error) {
@@ -860,6 +939,35 @@ export default {
 
     if (url.pathname === "/telegram/webhook" && request.method === "POST") {
       return handleTelegramWebhook(request, env);
+    }
+
+
+    if (url.pathname === "/api/debug-search" && request.method === "GET") {
+      try {
+        const q = url.searchParams.get("q") || "";
+        const requestedCategory = normalizeRequestedCategories(url.searchParams.getAll("category"));
+        const count = clampCount(Number(url.searchParams.get("count") || "5"), 5);
+        const stories = await fetchLatestStoriesFromYle(60);
+        const filtered = requestedCategory.length > 0 ? stories.filter((story) => requestedCategory.includes(story.category || "yleinen")) : stories;
+        const searchResults = q ? rankStoriesBySearch(filtered, q).slice(0, count) : filtered.slice(0, count);
+        return json({
+          ok: true,
+          query: q,
+          requestedCategory,
+          totalStories: stories.length,
+          filteredStories: filtered.length,
+          categoryCounts: stories.reduce<Record<string, number>>((acc, story) => {
+            const key = story.category || "yleinen";
+            acc[key] = (acc[key] || 0) + 1;
+            return acc;
+          }, {}),
+          sampleStories: stories.slice(0, 20).map((story) => ({ title: story.title, category: story.category, link: story.link })),
+          results: searchResults.map((story) => ({ title: story.title, category: story.category, link: story.link, pubDate: story.pubDate })),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ ok: false, error: message }, 500);
+      }
     }
 
     if (url.pathname === "/api/bootstrap" && request.method === "POST") {
