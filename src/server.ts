@@ -564,6 +564,8 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
       return categoriesHelpText();
     }
 
+
+    
     if (intent.action === "unsupported_search") {
       return [
         "Vapaa hakusana ei ole käytössä tässä versiossa.",
