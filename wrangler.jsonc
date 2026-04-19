@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "yle-signal",
+  "name": "ylesignal",
   "main": "src/server.ts",
   "compatibility_date": "2026-04-19",
   "compatibility_flags": ["nodejs_compat"],
