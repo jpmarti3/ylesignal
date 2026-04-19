@@ -88,7 +88,7 @@ export type BriefingState = {
 
 function decodeXml(value: string): string {
   return value
-    .replace(/<!\[CDATA\[([\\s\\S]*?)\]\]>/g, "$1")
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
@@ -158,7 +158,7 @@ function classifyCategory(text: string, rssCategories: string[] = []): CategoryK
 }
 
 function parseRss(xml: string): Story[] {
-  const items = [...xml.matchAll(/<item>([\\s\\S]*?)<\/item>/gi)];
+  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
   return items
     .map((match) => {
       const item = match[1];
@@ -241,7 +241,7 @@ function previewText(value: string, length = 240): string {
 
 function parseModelJson(text: string) {
   const trimmed = text.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\\s\\S]*?)\s*```$/i);
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   const candidate = fenced ? fenced[1].trim() : trimmed;
   return JSON.parse(candidate);
 }
