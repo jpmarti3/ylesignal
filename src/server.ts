@@ -569,9 +569,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
         "Vapaa hakusana ei ole käytössä tässä versiossa.",
         "Voit pyytää uutisia vain tuetuista RSS-kategorioista: talous, politiikka, kulttuuri, tiede, urheilu.",
         'Esimerkki: "Anna 3 uusinta talousuutista"',
-      ].join("
-
-");
+      ].join("\n");
     }
 
     const count = clampCount(intent.count, this.state.lastCount || 3);
@@ -584,9 +582,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
         lastCount: count,
         lastResultSummary: "Uusimmat uutiset",
       });
-      return [`Tässä ${count} uusinta Ylen uutista`, formatStoryList(stories, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("
-
-");
+      return [`Tässä ${count} uusinta Ylen uutista`, formatStoryList(stories, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("\n");
     }
 
     const categories = intent.categories && intent.categories.length > 0 ? intent.categories : this.state.lastCategories;
@@ -603,9 +599,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
       ? `Tässä ${count} uusinta uutista kategorioista: ${categories.join(", ")}`
       : `Tässä ${count} uusinta Ylen uutista`;
 
-    return [heading, formatStoryList(stories, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("
-
-");
+    return [heading, formatStoryList(stories, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("\n");
   }
 }
 
