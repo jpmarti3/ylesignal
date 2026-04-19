@@ -525,7 +525,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
     const normalized = normalizeFinnishText(text)
       .replace(/([a-zåäö])(uutis[a-zåäö]*)/g, "$1 $2")
       .replace(/([a-zåäö])(uut[a-zåäö]*)/g, "$1 $2");
-    const countMatch = normalized.match(/([1-8])/);
+    const countMatch = normalized.match(/\b([1-8])\b/);
     const count = clampCount(countMatch ? Number(countMatch[1]) : undefined, this.state.lastCount || 3);
 
     if (normalized.includes("kategoria") || normalized.includes("category") || normalized.includes("mitä aiheita")) {
