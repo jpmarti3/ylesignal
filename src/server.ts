@@ -85,7 +85,7 @@ export type BriefingState = {
 
 function decodeXml(value: string): string {
   return value
-    .replace(/<!\[CDATA\[([\\s\\S]*?)\]\]>/g, "$1")
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
@@ -155,7 +155,7 @@ function classifyCategory(text: string, rssCategories: string[] = []): CategoryK
 }
 
 function parseRss(xml: string): Story[] {
-  const items = [...xml.matchAll(/<item>([\\s\\S]*?)<\/item>/gi)];
+  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
   return items
     .map((match) => {
       const item = match[1];
@@ -230,7 +230,7 @@ function json(data: unknown, status = 200): Response {
 
 function parseModelJson(text: string) {
   const trimmed = text.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\\s\\S]*?)\s*```$/i);
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   const candidate = fenced ? fenced[1].trim() : trimmed;
   return JSON.parse(candidate);
 }
@@ -493,7 +493,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
       "Valitse unsupported_search, jos käyttäjä haluaa vapaan hakusanan tai yleishaun.",
       `Käyttäjän viesti: ${text}`,
       `Varafallback JSON: ${JSON.stringify(fallback)}`,
-    ].join("\n");
+    ].join("\n\n");
 
     try {
       const result = await generateText({
@@ -564,14 +564,12 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
       return categoriesHelpText();
     }
 
-
-    
     if (intent.action === "unsupported_search") {
       return [
         "Vapaa hakusana ei ole käytössä tässä versiossa.",
         "Voit pyytää uutisia vain tuetuista RSS-kategorioista: talous, politiikka, kulttuuri, tiede, urheilu.",
         'Esimerkki: "Anna 3 uusinta talousuutista"',
-      ].join("\n");
+      ].join("\n\n");
     }
 
     const count = clampCount(intent.count, this.state.lastCount || 3);
@@ -584,7 +582,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
         lastCount: count,
         lastResultSummary: "Uusimmat uutiset",
       });
-      return [`Tässä ${count} uusinta Ylen uutista`, formatStoryList(stories, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("\n");
+      return [`Tässä ${count} uusinta Ylen uutista`, formatStoryList(stories, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("\n\n");
     }
 
     const categories = intent.categories && intent.categories.length > 0 ? intent.categories : this.state.lastCategories;
@@ -601,7 +599,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
       ? `Tässä ${count} uusinta uutista kategorioista: ${categories.join(", ")}`
       : `Tässä ${count} uusinta Ylen uutista`;
 
-    return [heading, formatStoryList(stories, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("\n");
+    return [heading, formatStoryList(stories, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("\n\n");
   }
 }
 
@@ -893,6 +891,36 @@ export default {
 
     if (url.pathname === "/telegram/webhook" && request.method === "POST") {
       return handleTelegramWebhook(request, env);
+    }
+
+
+    if (url.pathname === "/api/debug-feed" && request.method === "GET") {
+      const feedUrl = url.searchParams.get("url") || YLE_RSS_URL;
+      const response = await fetch(feedUrl, {
+        headers: {
+          "user-agent": "ylesignal/1.0",
+          "accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+        },
+        redirect: "follow",
+      });
+      const xml = await response.text();
+      const parsed = parseRss(xml);
+      return json({
+        ok: true,
+        feedUrl,
+        finalUrl: response.url,
+        status: response.status,
+        contentType: response.headers.get("content-type"),
+        preview: xml.slice(0, 800),
+        parsedCount: parsed.length,
+        firstItems: parsed.slice(0, 5),
+      });
+    }
+
+    if (url.pathname === "/api/debug-category" && request.method === "GET") {
+      const category = url.searchParams.get("category") || "";
+      const stories = await fetchStoriesByCategories([category], 10);
+      return json({ ok: true, category, count: stories.length, stories });
     }
 
     if (url.pathname === "/api/bootstrap" && request.method === "POST") {
