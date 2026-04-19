@@ -58,3 +58,6 @@ Then chat with your bot in Telegram using messages like:
 - `GET /api/telegram-webhook` - show Telegram webhook status
 - `POST /api/telegram-webhook` - configure Telegram webhook to the current Worker URL
 - `POST /telegram/webhook` - receives Telegram bot updates
+
+
+Search behavior: free-text search is performed over the latest fetched Yle Finnish news corpus and the bot echoes the exact search term used back to the user for refinement in follow-up chats.

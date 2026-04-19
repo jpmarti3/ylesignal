@@ -5,7 +5,6 @@ import { createWorkersAI } from "workers-ai-provider";
 
 const APP_AGENT_NAME = "yle-signal";
 const YLE_RSS_URL = "https://yle.fi/rss/uutiset/tuoreimmat";
-const YLE_SEARCH_BASE = "https://haku.yle.fi/";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 
 const CATEGORY_DEFINITIONS = [
@@ -93,18 +92,61 @@ function decodeXml(value: string): string {
 }
 
 function matchTag(block: string, tag: string): string {
-  const match = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
+  const match = block.match(new RegExp(`<${tag}[^>]*>([\s\S]*?)<\/${tag}>`, "i"));
   return match ? decodeXml(match[1]) : "";
 }
 
-function classifyCategory(text: string): CategoryKey {
-  const normalized = text.toLowerCase();
+function matchTags(block: string, tag: string): string[] {
+  return [...block.matchAll(new RegExp(`<${tag}[^>]*>([\s\S]*?)<\/${tag}>`, "gi"))]
+    .map((match) => decodeXml(match[1]))
+    .filter(Boolean);
+}
+
+function normalizeFinnishText(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9åäö\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scoreCategory(text: string, category: (typeof CATEGORY_DEFINITIONS)[number]): number {
+  const normalized = normalizeFinnishText(text);
+  let score = 0;
+  for (const keyword of category.keywords) {
+    const key = normalizeFinnishText(keyword);
+    if (!key) continue;
+    if (normalized.includes(key)) score += Math.max(1, key.length > 6 ? 2 : 1);
+  }
+  return score;
+}
+
+function classifyCategory(text: string, rssCategories: string[] = []): CategoryKey {
+  const combined = `${text} ${rssCategories.join(" ")}`;
+  let best: CategoryKey = "yleinen";
+  let bestScore = 0;
+
   for (const category of CATEGORY_DEFINITIONS) {
-    if (category.keywords.some((keyword) => normalized.includes(keyword))) {
-      return category.key;
+    let score = scoreCategory(combined, category);
+    for (const rssCategory of rssCategories) {
+      const normalizedRss = normalizeFinnishText(rssCategory);
+      if (
+        normalizedRss.includes(normalizeFinnishText(category.key)) ||
+        normalizedRss.includes(normalizeFinnishText(category.label))
+      ) {
+        score += 3;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = category.key;
     }
   }
-  return "yleinen";
+
+  return best;
 }
 
 function parseRss(xml: string): Story[] {
@@ -114,57 +156,61 @@ function parseRss(xml: string): Story[] {
       const item = match[1];
       const title = matchTag(item, "title");
       const summary = matchTag(item, "description") || matchTag(item, "content:encoded") || "";
+      const rssCategories = matchTags(item, "category");
       return {
         title,
         link: matchTag(item, "link"),
         pubDate: matchTag(item, "pubDate") || undefined,
         summary,
-        category: classifyCategory(`${title} ${summary}`),
+        category: classifyCategory(`${title} ${summary}`, rssCategories),
       } satisfies Story;
     })
     .filter((item) => item.title && item.link);
 }
 
-function decodeHtmlEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+function tokenizeSearchTerm(query: string): string[] {
+  const stopwords = new Set([
+    "ja", "tai", "on", "ovat", "se", "ne", "the", "a", "an", "of", "for", "to", "with",
+    "uusin", "uusinta", "uutinen", "uutisia", "news", "latest", "search", "hae", "etsi", "hakusanalla",
+  ]);
+
+  return Array.from(
+    new Set(
+      normalizeFinnishText(query)
+        .split(/\s+/)
+        .map((term) => term.trim())
+        .filter((term) => term.length >= 2 && !stopwords.has(term)),
+    ),
+  );
 }
 
-function parseYleSearchHtml(html: string, fallbackQuery: string): Story[] {
-  const results: Story[] = [];
-  const seenLinks = new Set<string>();
-  const anchorPattern = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+function scoreStoryForSearch(story: Story, terms: string[]): number {
+  const title = normalizeFinnishText(story.title);
+  const summary = normalizeFinnishText(story.summary);
+  const combined = `${title} ${summary}`;
+  let score = 0;
 
-  for (const match of html.matchAll(anchorPattern)) {
-    const href = match[1];
-    const title = decodeHtmlEntities(match[2]);
-    if (!title || title.length < 8) continue;
-
-    const absolute = href.startsWith("http") ? href : `https://yle.fi${href.startsWith("/") ? href : `/${href}`}`;
-    if (!absolute.startsWith("https://yle.fi")) continue;
-    if (absolute.includes("/rss") || absolute.includes("/aihe/") || absolute.includes("/haku")) continue;
-    if (seenLinks.has(absolute)) continue;
-
-    results.push({
-      title,
-      link: absolute,
-      summary: `Hakutulos Yle-hausta hakutermillä \"${fallbackQuery}\".`,
-      category: classifyCategory(title),
-    });
-    seenLinks.add(absolute);
-
-    if (results.length >= 8) break;
+  for (const term of terms) {
+    if (title.includes(term)) score += 5;
+    if (summary.includes(term)) score += 2;
+    if (combined.includes(term)) score += 1;
   }
 
-  return results;
+  const fullPhrase = normalizeFinnishText(terms.join(" "));
+  if (fullPhrase && combined.includes(fullPhrase)) score += 4;
+
+  return score;
+}
+
+function rankStoriesBySearch(stories: Story[], query: string): Story[] {
+  const terms = tokenizeSearchTerm(query);
+  if (terms.length === 0) return [];
+
+  return stories
+    .map((story, index) => ({ story, score: scoreStoryForSearch(story, terms), index }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map((entry) => entry.story);
 }
 
 function json(data: unknown, status = 200): Response {
@@ -314,6 +360,7 @@ function categoriesHelpText(): string {
     '• "Anna 3 uusinta talousuutista"',
     '• "Mitkä kategoriat ovat käytössä?"',
     '• "Hae uutisia hakusanalla datakeskus"',
+    '• "Etsi uutisia sanoilla Nato Suomi"',
     '• "Tarkenna hakua lisäämällä Oulu"',
   ].join("\n");
 }
@@ -369,32 +416,9 @@ async function fetchLatestStoriesFromYle(limit = 12): Promise<Story[]> {
 }
 
 async function searchNewsFromYle(query: string, limit = 5): Promise<Story[]> {
-  const searchUrl = `${YLE_SEARCH_BASE}?q=${encodeURIComponent(query)}&type=article&language=fi&uiLanguage=fi`;
-  const response = await fetch(searchUrl, {
-    headers: {
-      "user-agent": "yle-signal-demo/0.5",
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`Yle search request failed with ${response.status}`);
-  }
-
-  const html = await response.text();
-  const parsedResults = parseYleSearchHtml(html, query).slice(0, limit);
-  if (parsedResults.length > 0) {
-    return parsedResults;
-  }
-
-  const fallback = (await fetchLatestStoriesFromYle(20)).filter((story) => {
-    const haystack = `${story.title} ${story.summary}`.toLowerCase();
-    return query
-      .toLowerCase()
-      .split(/\s+/)
-      .filter(Boolean)
-      .every((term) => haystack.includes(term));
-  });
-  return fallback.slice(0, limit);
+  const corpus = await fetchLatestStoriesFromYle(60);
+  const ranked = rankStoriesBySearch(corpus, query);
+  return ranked.slice(0, limit);
 }
 
 function formatSearchResponse(searchTerm: string, stories: Story[], count: number): string {
