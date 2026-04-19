@@ -493,9 +493,7 @@ export class TelegramAgent extends Agent<Env, TelegramAgentState> {
       "Valitse unsupported_search, jos käyttäjä haluaa vapaan hakusanan tai yleishaun.",
       `Käyttäjän viesti: ${text}`,
       `Varafallback JSON: ${JSON.stringify(fallback)}`,
-    ].join("
-
-");
+    ].join("\n");
 
     try {
       const result = await generateText({
