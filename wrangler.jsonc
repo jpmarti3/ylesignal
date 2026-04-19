@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "yle-signal",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-04-19",
+  "compatibility_flags": ["nodejs_compat"],
+  "ai": {
+    "binding": "AI"
+  },
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "BriefingAgent",
+        "class_name": "BriefingAgent"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["BriefingAgent"]
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}

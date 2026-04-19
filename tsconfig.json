@@ -1,0 +1,8 @@
+{
+  "extends": "agents/tsconfig",
+  "compilerOptions": {
+    "strict": true,
+    "types": ["./worker-configuration.d.ts"]
+  },
+  "include": ["src/**/*.ts", "worker-configuration.d.ts"]
+}

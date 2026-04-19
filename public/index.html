@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Yle Signal</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 0;
+        background: #f5f7fb;
+        color: #1c2430;
+      }
+      main {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .card {
+        background: white;
+        border-radius: 16px;
+        padding: 20px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.06);
+        margin-bottom: 16px;
+      }
+      button {
+        border: 0;
+        background: #0b57d0;
+        color: white;
+        padding: 10px 16px;
+        border-radius: 10px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button.secondary {
+        background: #e8eefc;
+        color: #0b57d0;
+      }
+      .row {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .muted {
+        color: #617084;
+        font-size: 14px;
+      }
+      ul {
+        padding-left: 20px;
+      }
+      li + li {
+        margin-top: 12px;
+      }
+      .pill {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: #eef3ff;
+        color: #3559b7;
+        font-size: 12px;
+        margin-left: 8px;
+      }
+      pre {
+        white-space: pre-wrap;
+        font-family: inherit;
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="card">
+        <h1>Yle Signal</h1>
+        <p class="muted">A lightweight two-agent Cloudflare demo that turns the latest Yle English headlines into a morning briefing.</p>
+        <div class="row">
+          <button id="refreshBtn">Generate digest now</button>
+          <button id="historyBtn" class="secondary">Load history</button>
+          <span id="statusText" class="muted">Bootstrapping…</span>
+        </div>
+      </div>
+
+      <section id="digestCard" class="card">
+        <h2>Latest digest</h2>
+        <div id="digestContent" class="muted">No digest yet.</div>
+      </section>
+
+      <section id="historyCard" class="card" hidden>
+        <h2>Recent digests</h2>
+        <div id="historyContent" class="muted">History has not been loaded yet.</div>
+      </section>
+    </main>
+
+    <script>
+      const statusText = document.getElementById("statusText");
+      const digestContent = document.getElementById("digestContent");
+      const historyCard = document.getElementById("historyCard");
+      const historyContent = document.getElementById("historyContent");
+
+      function escapeHtml(text) {
+        return String(text)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function renderDigest(payload) {
+        if (!payload || !payload.digest) {
+          digestContent.innerHTML = '<p class="muted">No digest available yet. Click “Generate digest now”.</p>';
+          return;
+        }
+
+        const digest = payload.digest;
+        const storyHtml = (digest.stories || [])
+          .map((story) => `
+            <li>
+              <a href="${escapeHtml(story.link)}" target="_blank" rel="noreferrer">${escapeHtml(story.title)}</a>
+              <span class="pill">${escapeHtml(story.category || "general")}</span>
+              <div>${escapeHtml(story.whyItMatters || "")}</div>
+            </li>
+          `)
+          .join("");
+
+        digestContent.innerHTML = `
+          <p class="muted">Generated: ${escapeHtml(digest.generatedAt)}</p>
+          <h3>${escapeHtml(digest.headline || "Daily briefing")}</h3>
+          <p>${escapeHtml(digest.summary || "")}</p>
+          <p><strong>Watch next:</strong> ${escapeHtml(digest.watchNext || "")}</p>
+          <ul>${storyHtml}</ul>
+        `;
+      }
+
+      function renderStatus(payload) {
+        const status = payload?.status?.status || "idle";
+        const lastRunAt = payload?.status?.lastRunAt || "never";
+        const lastError = payload?.status?.lastError;
+        statusText.textContent = `Status: ${status}. Last run: ${lastRunAt}${lastError ? ` · Error: ${lastError}` : ""}`;
+      }
+
+      async function loadLatest() {
+        const response = await fetch("/api/latest");
+        const payload = await response.json();
+        renderDigest(payload);
+        renderStatus(payload);
+      }
+
+      async function bootstrap() {
+        await fetch("/api/bootstrap", { method: "POST" });
+        await loadLatest();
+      }
+
+      async function generateNow() {
+        statusText.textContent = "Generating digest…";
+        const response = await fetch("/api/refresh", { method: "POST" });
+        const payload = await response.json();
+        renderDigest({ digest: payload.digest, status: { status: "idle", lastRunAt: payload.digest?.generatedAt || new Date().toISOString(), lastError: null } });
+        await loadLatest();
+      }
+
+      async function loadHistory() {
+        const response = await fetch("/api/history");
+        const payload = await response.json();
+        historyCard.hidden = false;
+        const items = payload.history || [];
+        historyContent.innerHTML = items.length
+          ? items.map((item) => `
+              <article style="margin-bottom: 16px;">
+                <strong>${escapeHtml(item.headline)}</strong>
+                <div class="muted">${escapeHtml(item.generatedAt)}</div>
+                <div>${escapeHtml(item.summary)}</div>
+              </article>
+            `).join("")
+          : '<p class="muted">No history yet.</p>';
+      }
+
+      document.getElementById("refreshBtn").addEventListener("click", generateNow);
+      document.getElementById("historyBtn").addEventListener("click", loadHistory);
+
+      bootstrap().catch((error) => {
+        statusText.textContent = `Failed to load app: ${error.message}`;
+      });
+    </script>
+  </body>
+</html>
