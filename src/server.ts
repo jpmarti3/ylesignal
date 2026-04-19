@@ -5,13 +5,30 @@ import { createWorkersAI } from "workers-ai-provider";
 
 const APP_AGENT_NAME = "yle-signal";
 const YLE_RSS_URL = "https://yle.fi/rss/uutiset/tuoreimmat";
+const YLE_SEARCH_BASE = "https://haku.yle.fi/";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
+
+const CATEGORY_DEFINITIONS = [
+  { key: "politiikka", label: "Politiikka", keywords: ["hallitus", "eduskunta", "presidentti", "ministeri", "puolue", "politiikka", "vaali"] },
+  { key: "talous", label: "Talous", keywords: ["talous", "yritys", "pörssi", "markkina", "vero", "inflaatio", "työllisyys", "investointi"] },
+  { key: "teknologia", label: "Teknologia", keywords: ["teknologia", "tekoäly", "ai", "ohjelmisto", "data", "kyber", "robotti", "sovellus"] },
+  { key: "urheilu", label: "Urheilu", keywords: ["urheilu", "liiga", "ottelu", "maali", "jääkiekko", "jalkapallo", "yleisurheilu", "kisat"] },
+  { key: "kulttuuri", label: "Kulttuuri", keywords: ["kulttuuri", "taide", "musiikki", "teatteri", "elokuva", "kirja", "ooppera"] },
+  { key: "turvallisuus", label: "Turvallisuus", keywords: ["turvallisuus", "rikos", "poliisi", "onnettomuus", "sota", "puolustus", "rajavartiosto", "pelastus"] },
+  { key: "maailma", label: "Maailma", keywords: ["ukraina", "eurooppa", "usa", "kiina", "venäjä", "nato", "ulkomaat", "maailma"] },
+  { key: "tiede", label: "Tiede", keywords: ["tiede", "tutkimus", "avaruus", "ilmasto", "lääke", "yliopisto", "tutkija"] },
+] as const;
+
+const CATEGORY_KEYS = new Set(CATEGORY_DEFINITIONS.map((category) => category.key));
+
+type CategoryKey = (typeof CATEGORY_DEFINITIONS)[number]["key"] | "yleinen";
 
 type Story = {
   title: string;
   link: string;
   pubDate?: string;
   summary: string;
+  category?: CategoryKey;
 };
 
 type DigestStory = {
@@ -35,6 +52,21 @@ type DeliveryState = {
   telegramEnabled: boolean;
   lastTelegramAt: string | null;
   lastTelegramError: string | null;
+};
+
+type ParsedTelegramIntent = {
+  action: "help" | "categories" | "category_news" | "search" | "refine_search";
+  count?: number;
+  categories?: string[];
+  searchTerm?: string;
+  refineText?: string;
+};
+
+type TelegramAgentState = {
+  lastSearchTerm: string | null;
+  lastResultSummary: string | null;
+  lastCategories: string[];
+  lastCount: number;
 };
 
 export type BriefingState = {
@@ -65,19 +97,74 @@ function matchTag(block: string, tag: string): string {
   return match ? decodeXml(match[1]) : "";
 }
 
+function classifyCategory(text: string): CategoryKey {
+  const normalized = text.toLowerCase();
+  for (const category of CATEGORY_DEFINITIONS) {
+    if (category.keywords.some((keyword) => normalized.includes(keyword))) {
+      return category.key;
+    }
+  }
+  return "yleinen";
+}
+
 function parseRss(xml: string): Story[] {
   const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
   return items
     .map((match) => {
       const item = match[1];
+      const title = matchTag(item, "title");
+      const summary = matchTag(item, "description") || matchTag(item, "content:encoded") || "";
       return {
-        title: matchTag(item, "title"),
+        title,
         link: matchTag(item, "link"),
         pubDate: matchTag(item, "pubDate") || undefined,
-        summary: matchTag(item, "description") || matchTag(item, "content:encoded") || "",
+        summary,
+        category: classifyCategory(`${title} ${summary}`),
       } satisfies Story;
     })
     .filter((item) => item.title && item.link);
+}
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseYleSearchHtml(html: string, fallbackQuery: string): Story[] {
+  const results: Story[] = [];
+  const seenLinks = new Set<string>();
+  const anchorPattern = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+
+  for (const match of html.matchAll(anchorPattern)) {
+    const href = match[1];
+    const title = decodeHtmlEntities(match[2]);
+    if (!title || title.length < 8) continue;
+
+    const absolute = href.startsWith("http") ? href : `https://yle.fi${href.startsWith("/") ? href : `/${href}`}`;
+    if (!absolute.startsWith("https://yle.fi")) continue;
+    if (absolute.includes("/rss") || absolute.includes("/aihe/") || absolute.includes("/haku")) continue;
+    if (seenLinks.has(absolute)) continue;
+
+    results.push({
+      title,
+      link: absolute,
+      summary: `Hakutulos Yle-hausta hakutermillä \"${fallbackQuery}\".`,
+      category: classifyCategory(title),
+    });
+    seenLinks.add(absolute);
+
+    if (results.length >= 8) break;
+  }
+
+  return results;
 }
 
 function json(data: unknown, status = 200): Response {
@@ -102,7 +189,7 @@ function fallbackDigest(stories: Story[]): Omit<DailyDigest, "generatedAt" | "so
     title: story.title,
     link: story.link,
     pubDate: story.pubDate,
-    category: "uutiset",
+    category: story.category || "yleinen",
     whyItMatters: "Tämä on yksi Ylen uusimmista uutisista ja sitä kannattaa seurata päivän aikana.",
   }));
 
@@ -119,7 +206,7 @@ function normalizeDigestStory(story: Partial<DigestStory>, fallback: Story): Dig
     title: story.title || fallback.title,
     link: story.link || fallback.link,
     pubDate: story.pubDate || fallback.pubDate,
-    category: story.category || "uutiset",
+    category: story.category || fallback.category || "yleinen",
     whyItMatters:
       story.whyItMatters || "Tämä on yksi Ylen uusimmista uutisista ja sitä kannattaa seurata päivän aikana.",
   };
@@ -147,11 +234,7 @@ function formatTelegramDigest(digest: DailyDigest): string {
     .slice(0, 3)
     .map((story, index) => {
       const number = index + 1;
-      return [
-        `${number}. ${story.title}`,
-        `Miksi tärkeä: ${story.whyItMatters}`,
-        `${story.link}`,
-      ].join("\n");
+      return [`${number}. ${story.title}`, `Miksi tärkeä: ${story.whyItMatters}`, `${story.link}`].join("\n");
     })
     .join("\n\n");
 
@@ -170,44 +253,298 @@ function telegramIsConfigured(env: Env): boolean {
   return Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID);
 }
 
-async function sendTelegramMessage(env: Env, text: string): Promise<void> {
-  if (!telegramIsConfigured(env)) {
-    throw new Error("Telegram ei ole määritetty. Lisää salaisuudet TELEGRAM_BOT_TOKEN ja TELEGRAM_CHAT_ID.");
+async function telegramApi(env: Env, method: string, payload?: unknown) {
+  if (!env.TELEGRAM_BOT_TOKEN) {
+    throw new Error("Telegram ei ole määritetty. Lisää salaisuus TELEGRAM_BOT_TOKEN.");
   }
 
-  const response = await fetch(`${TELEGRAM_API_BASE}/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const response = await fetch(`${TELEGRAM_API_BASE}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: {
       "content-type": "application/json; charset=utf-8",
     },
-    body: JSON.stringify({
-      chat_id: env.TELEGRAM_CHAT_ID,
-      text,
-      disable_web_page_preview: false,
-    }),
+    body: payload ? JSON.stringify(payload) : undefined,
   });
 
-  const payload = await response.json().catch(() => null);
-  if (!response.ok || payload?.ok === false) {
-    const description = payload?.description || `Telegram sendMessage failed with ${response.status}`;
+  const data = await response.json().catch(() => null);
+  if (!response.ok || data?.ok === false) {
+    const description = data?.description || `Telegram ${method} failed with ${response.status}`;
     throw new Error(description);
   }
+
+  return data;
+}
+
+async function sendTelegramMessage(env: Env, text: string, chatId?: string | number): Promise<void> {
+  const resolvedChatId = chatId ?? env.TELEGRAM_CHAT_ID;
+  if (!resolvedChatId) {
+    throw new Error("Telegram ei ole määritetty. Lisää salaisuudet TELEGRAM_BOT_TOKEN ja TELEGRAM_CHAT_ID.");
+  }
+
+  await telegramApi(env, "sendMessage", {
+    chat_id: resolvedChatId,
+    text,
+    disable_web_page_preview: false,
+  });
+}
+
+async function setTelegramWebhook(env: Env, baseUrl: string) {
+  const payload: Record<string, unknown> = {
+    url: `${baseUrl.replace(/\/$/, "")}/telegram/webhook`,
+    allowed_updates: ["message"],
+  };
+
+  if (env.TELEGRAM_WEBHOOK_SECRET) {
+    payload.secret_token = env.TELEGRAM_WEBHOOK_SECRET;
+  }
+
+  return telegramApi(env, "setWebhook", payload);
+}
+
+async function getTelegramWebhookInfo(env: Env) {
+  return telegramApi(env, "getWebhookInfo", {});
+}
+
+function categoriesHelpText(): string {
+  return [
+    "Tuetut uutiskategoriat:",
+    ...CATEGORY_DEFINITIONS.map((category) => `- ${category.label} (${category.key})`),
+    "",
+    "Esimerkkejä:",
+    '• "Anna 3 uusinta talousuutista"',
+    '• "Mitkä kategoriat ovat käytössä?"',
+    '• "Hae uutisia hakusanalla datakeskus"',
+    '• "Tarkenna hakua lisäämällä Oulu"',
+  ].join("\n");
+}
+
+function clampCount(value: number | undefined, fallback = 3): number {
+  const resolved = value ?? fallback;
+  return Math.max(1, Math.min(8, resolved));
+}
+
+function normalizeRequestedCategories(values?: string[]): CategoryKey[] {
+  if (!Array.isArray(values) || values.length === 0) return [];
+  const normalized = values
+    .map((value) => value.toLowerCase().trim())
+    .map((value) => {
+      if (CATEGORY_KEYS.has(value as CategoryKey)) return value as CategoryKey;
+      const found = CATEGORY_DEFINITIONS.find(
+        (category) => category.label.toLowerCase() === value || category.keywords.includes(value),
+      );
+      return found?.key;
+    })
+    .filter((value): value is CategoryKey => Boolean(value));
+  return Array.from(new Set(normalized));
+}
+
+function formatStoryList(stories: Story[], count: number): string {
+  const selected = stories.slice(0, count);
+  if (selected.length === 0) {
+    return "En löytänyt uutisia tällä pyynnöllä.";
+  }
+
+  return selected
+    .map((story, index) => {
+      const category = story.category ? ` [${story.category}]` : "";
+      return `${index + 1}. ${story.title}${category}\n${story.link}`;
+    })
+    .join("\n\n");
+}
+
+
+async function fetchLatestStoriesFromYle(limit = 12): Promise<Story[]> {
+  const response = await fetch(YLE_RSS_URL, {
+    headers: {
+      "user-agent": "yle-signal-demo/0.5",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Yle RSS request failed with ${response.status}`);
+  }
+
+  const xml = await response.text();
+  return parseRss(xml).slice(0, limit);
+}
+
+async function searchNewsFromYle(query: string, limit = 5): Promise<Story[]> {
+  const searchUrl = `${YLE_SEARCH_BASE}?q=${encodeURIComponent(query)}&type=article&language=fi&uiLanguage=fi`;
+  const response = await fetch(searchUrl, {
+    headers: {
+      "user-agent": "yle-signal-demo/0.5",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Yle search request failed with ${response.status}`);
+  }
+
+  const html = await response.text();
+  const parsedResults = parseYleSearchHtml(html, query).slice(0, limit);
+  if (parsedResults.length > 0) {
+    return parsedResults;
+  }
+
+  const fallback = (await fetchLatestStoriesFromYle(20)).filter((story) => {
+    const haystack = `${story.title} ${story.summary}`.toLowerCase();
+    return query
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean)
+      .every((term) => haystack.includes(term));
+  });
+  return fallback.slice(0, limit);
+}
+
+function formatSearchResponse(searchTerm: string, stories: Story[], count: number): string {
+  return [
+    `Käytetty hakutermi: ${searchTerm}`,
+    stories.length > 0 ? formatStoryList(stories, count) : "En löytänyt hakutuloksia tällä haulla.",
+    'Voit tarkentaa jatkossa esimerkiksi: "tarkenna hakua lisäämällä Helsinki".',
+  ].join("\n\n");
 }
 
 export class ScoutAgent extends Agent<Env> {
   async fetchLatestStories(limit = 12): Promise<Story[]> {
-    const response = await fetch(YLE_RSS_URL, {
-      headers: {
-        "user-agent": "yle-signal-demo/0.3",
-      },
-    });
+    return fetchLatestStoriesFromYle(limit);
+  }
 
-    if (!response.ok) {
-      throw new Error(`Yle RSS request failed with ${response.status}`);
+  async searchNews(query: string, limit = 5): Promise<Story[]> {
+    return searchNewsFromYle(query, limit);
+  }
+}
+
+export class TelegramAgent extends Agent<Env, TelegramAgentState> {
+  initialState: TelegramAgentState = {
+    lastSearchTerm: null,
+    lastResultSummary: null,
+    lastCategories: [],
+    lastCount: 3,
+  };
+
+  private getModel() {
+    return createWorkersAI({ binding: this.env.AI })("@cf/moonshotai/kimi-k2.5");
+  }
+
+  private async parseIntent(text: string): Promise<ParsedTelegramIntent> {
+    const fallback = this.parseIntentHeuristically(text);
+    const prompt = [
+      "Tunnista käyttäjän uutispyynnön intentio ja palauta VAIN kelvollinen JSON.",
+      "Sallitut action-arvot: help, categories, category_news, search, refine_search.",
+      "Palauta myös count (1-8), categories (taulukko avaimista: politiikka, talous, teknologia, urheilu, kulttuuri, turvallisuus, maailma, tiede), searchTerm ja refineText tarvittaessa.",
+      "Valitse categories, jos käyttäjä kysyy käytettävissä olevia kategorioita.",
+      "Valitse search, jos käyttäjä haluaa hakea uutisia millä tahansa hakusanalla.",
+      "Valitse refine_search, jos käyttäjä haluaa tarkentaa edellistä hakua kuten 'tarkenna' tai 'lisää mukaan'.",
+      `Käyttäjän viesti: ${text}`,
+      `Varafallback JSON: ${JSON.stringify(fallback)}`,
+    ].join("\n\n");
+
+    try {
+      const result = await generateText({
+        model: this.getModel(),
+        prompt,
+      });
+      const parsed = parseModelJson(result.text) as ParsedTelegramIntent;
+      return {
+        action: parsed.action || fallback.action,
+        count: clampCount(parsed.count, fallback.count),
+        categories: normalizeRequestedCategories(parsed.categories),
+        searchTerm: parsed.searchTerm?.trim(),
+        refineText: parsed.refineText?.trim(),
+      };
+    } catch {
+      return fallback;
+    }
+  }
+
+  private parseIntentHeuristically(text: string): ParsedTelegramIntent {
+    const normalized = text.toLowerCase();
+    const countMatch = normalized.match(/\b([1-8])\b/);
+    const count = clampCount(countMatch ? Number(countMatch[1]) : undefined, this.state.lastCount || 3);
+
+    if (normalized.includes("kategoria") || normalized.includes("category") || normalized.includes("mitä aiheita")) {
+      return { action: "categories", count };
     }
 
-    const xml = await response.text();
-    return parseRss(xml).slice(0, limit);
+    if (normalized.includes("tarkenna") || normalized.includes("refine") || normalized.includes("lisää mukaan")) {
+      return {
+        action: "refine_search",
+        count,
+        refineText: text.replace(/^(tarkenna hakua|tarkenna|refine search|refine|lisää mukaan)\s*/i, "").trim(),
+      };
+    }
+
+    const categories = normalizeRequestedCategories(
+      CATEGORY_DEFINITIONS.filter((category) => {
+        const aliases = [category.key, category.label.toLowerCase(), ...category.keywords];
+        return aliases.some((alias) => normalized.includes(alias.toLowerCase()));
+      }).map((category) => category.key),
+    );
+
+    if (normalized.includes("etsi") || normalized.includes("hae") || normalized.includes("search")) {
+      const searchTerm = text.replace(/^(etsi|hae|search)\s+/i, "").trim();
+      return { action: "search", count, categories, searchTerm: searchTerm || text.trim() };
+    }
+
+    if (categories.length > 0 || normalized.includes("uusin") || normalized.includes("latest") || normalized.includes("uuti")) {
+      return { action: "category_news", count, categories };
+    }
+
+    return { action: "help", count };
+  }
+
+  async handleIncomingMessage(text: string): Promise<string> {
+    const intent = await this.parseIntent(text);
+
+    if (intent.action === "help" || intent.action === "categories") {
+      return categoriesHelpText();
+    }
+
+    if (intent.action === "category_news") {
+      const stories = await fetchLatestStoriesFromYle(20);
+      const categories = intent.categories && intent.categories.length > 0 ? intent.categories : this.state.lastCategories;
+      const count = clampCount(intent.count, this.state.lastCount || 3);
+      const filtered = categories.length > 0
+        ? stories.filter((story) => categories.includes(story.category || "yleinen"))
+        : stories;
+
+      this.setState({
+        ...this.state,
+        lastCategories: categories,
+        lastCount: count,
+        lastResultSummary: `Kategoriauutiset: ${categories.join(", ") || "yleinen"}`,
+      });
+
+      const heading = categories.length > 0
+        ? `Tässä ${count} uusinta uutista kategorioista: ${categories.join(", ")}`
+        : `Tässä ${count} uusinta Ylen uutista`;
+
+      return [heading, formatStoryList(filtered, count), 'Kysy myös: "Mitkä kategoriat ovat käytössä?"'].join("\n\n");
+    }
+
+    const count = clampCount(intent.count, this.state.lastCount || 3);
+    let searchTerm = intent.searchTerm?.trim();
+
+    if (intent.action === "refine_search") {
+      if (!this.state.lastSearchTerm) {
+        return 'Minulla ei ole vielä aiempaa hakua tarkennettavaksi. Aloita esimerkiksi: "Hae uutisia hakusanalla datakeskus".';
+      }
+      searchTerm = `${this.state.lastSearchTerm} ${intent.refineText || ""}`.trim();
+    }
+
+    if (!searchTerm) {
+      return 'En saanut hakutermiä talteen. Kokeile esimerkiksi: "Hae uutisia hakusanalla merituulivoima".';
+    }
+
+    const stories = await searchNewsFromYle(searchTerm, count);
+    this.setState({
+      ...this.state,
+      lastSearchTerm: searchTerm,
+      lastCount: count,
+      lastResultSummary: `Hakutermi: ${searchTerm}`,
+    });
+    return formatSearchResponse(searchTerm, stories, count);
   }
 }
 
@@ -235,9 +572,7 @@ export class BriefingAgent extends Think<Env, BriefingState> {
     return [
       "You are Yle Signal, a concise analyst that explains the latest Yle news in Finnish.",
       "Only use the stored digest below. If the user asks about something not present, say so clearly.",
-      digest
-        ? `Latest digest JSON: ${JSON.stringify(digest)}`
-        : "No digest exists yet. Suggest running a new digest.",
+      digest ? `Latest digest JSON: ${JSON.stringify(digest)}` : "No digest exists yet. Suggest running a new digest.",
     ].join("\n\n");
   }
 
@@ -336,7 +671,6 @@ export class BriefingAgent extends Think<Env, BriefingState> {
         delivery,
       });
 
-      console.log("Digest built", { trigger: payload?.trigger ?? "manual", stories: digest.stories.length, sentToTelegram: delivery.lastTelegramAt === digest.generatedAt || delivery.lastTelegramAt !== null });
       return digest;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -372,6 +706,11 @@ export class BriefingAgent extends Think<Env, BriefingState> {
     return { ok: true, sentAt };
   }
 
+  async handleTelegramChat(chatId: string, text: string): Promise<string> {
+    const agent = await this.subAgent(TelegramAgent, `telegram-${chatId}`);
+    return agent.handleIncomingMessage(text);
+  }
+
   getLatestDigest(): DailyDigest | null {
     return this.state.latestDigest;
   }
@@ -395,6 +734,41 @@ export class BriefingAgent extends Think<Env, BriefingState> {
 
 async function getBriefingAgent(env: Env) {
   return getAgentByName(env.BriefingAgent, APP_AGENT_NAME);
+}
+
+async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
+  if (env.TELEGRAM_WEBHOOK_SECRET) {
+    const header = request.headers.get("x-telegram-bot-api-secret-token");
+    if (header !== env.TELEGRAM_WEBHOOK_SECRET) {
+      return json({ ok: false, error: "Unauthorized webhook" }, 401);
+    }
+  }
+
+  const update = (await request.json().catch(() => null)) as
+    | {
+        message?: {
+          chat?: { id?: number | string };
+          text?: string;
+        };
+      }
+    | null;
+
+  const chatId = update?.message?.chat?.id;
+  const text = update?.message?.text?.trim();
+  if (!chatId || !text) {
+    return json({ ok: true, ignored: true });
+  }
+
+  try {
+    const agent = await getBriefingAgent(env);
+    const reply = await agent.handleTelegramChat(String(chatId), text);
+    await sendTelegramMessage(env, reply, chatId);
+    return json({ ok: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await sendTelegramMessage(env, `Tapahtui virhe: ${message}`, chatId).catch(() => undefined);
+    return json({ ok: false, error: message }, 500);
+  }
 }
 
 export default {
@@ -433,6 +807,35 @@ export default {
         const message = error instanceof Error ? error.message : String(error);
         return json({ ok: false, error: message }, 500);
       }
+    }
+
+    if (url.pathname === "/api/telegram-webhook" && request.method === "POST") {
+      try {
+        const result = await setTelegramWebhook(env, url.origin);
+        return json({ ok: true, result });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ ok: false, error: message }, 500);
+      }
+    }
+
+    if (url.pathname === "/api/telegram-webhook" && request.method === "GET") {
+      try {
+        if (url.searchParams.get("configure") === "1") {
+          const configured = await setTelegramWebhook(env, url.origin);
+          return json({ ok: true, configured, expectedWebhookUrl: `${url.origin}/telegram/webhook` });
+        }
+
+        const result = await getTelegramWebhookInfo(env);
+        return json({ ok: true, result, expectedWebhookUrl: `${url.origin}/telegram/webhook` });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ ok: false, error: message }, 500);
+      }
+    }
+
+    if (url.pathname === "/telegram/webhook" && request.method === "POST") {
+      return handleTelegramWebhook(request, env);
     }
 
     if (url.pathname === "/api/bootstrap" && request.method === "POST") {
