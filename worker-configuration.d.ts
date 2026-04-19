@@ -1,12 +1,5 @@
 interface AiBinding {}
 
-type DigestStory = {
-  title: string;
-  link: string;
-  pubDate?: string;
-  summary: string;
-};
-
 type DailyDigest = {
   generatedAt: string;
   source: string;
@@ -29,10 +22,17 @@ type BriefingState = {
   lastRunAt: string | null;
   status: "idle" | "running" | "error";
   lastError: string | null;
+  delivery: {
+    telegramEnabled: boolean;
+    lastTelegramAt: string | null;
+    lastTelegramError: string | null;
+  };
 };
 
 interface Env {
   AI: AiBinding;
   ASSETS: Fetcher;
   BriefingAgent: DurableObjectNamespace;
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_CHAT_ID?: string;
 }

@@ -72,9 +72,10 @@
     <main>
       <div class="card">
         <h1>Yle Signal</h1>
-        <p class="muted">Kevyt kahden agentin Cloudflare-demo, joka tekee Ylen tuoreimmista suomenkielisistä uutisista tiiviin katsauksen.</p>
+        <p class="muted">Kevyt kahden agentin Cloudflare-demo, joka tekee Ylen tuoreimmista suomenkielisistä uutisista tiiviin katsauksen ja voi lähettää sen Telegramiin.</p>
         <div class="row">
           <button id="refreshBtn">Luo katsaus nyt</button>
+          <button id="telegramBtn" class="secondary">Lähetä Telegramiin</button>
           <button id="historyBtn" class="secondary">Lataa historia</button>
           <span id="statusText" class="muted">Käynnistetään…</span>
         </div>
@@ -136,7 +137,11 @@
         const status = payload?.status?.status || "idle";
         const lastRunAt = payload?.status?.lastRunAt || "ei koskaan";
         const lastError = payload?.status?.lastError;
-        statusText.textContent = `Tila: ${status}. Viimeisin ajo: ${lastRunAt}${lastError ? ` · Virhe: ${lastError}` : ""}`;
+        const delivery = payload?.status?.delivery || {};
+        const telegramStatus = delivery.telegramEnabled
+          ? `Telegram: päällä${delivery.lastTelegramAt ? ` · viimeisin lähetys ${delivery.lastTelegramAt}` : ""}${delivery.lastTelegramError ? ` · virhe ${delivery.lastTelegramError}` : ""}`
+          : "Telegram: ei määritetty";
+        statusText.textContent = `Tila: ${status}. Viimeisin ajo: ${lastRunAt}${lastError ? ` · Virhe: ${lastError}` : ""} · ${telegramStatus}`;
       }
 
       async function loadLatest() {
@@ -181,6 +186,24 @@
         }
       }
 
+      async function sendTelegram() {
+        statusText.textContent = "Lähetetään Telegramiin…";
+
+        try {
+          const response = await fetch("/api/send-telegram", { method: "POST" });
+          const payload = await response.json().catch(() => ({}));
+
+          if (!response.ok || payload.ok === false) {
+            throw new Error(payload.error || `Request failed with ${response.status}`);
+          }
+
+          await loadLatest();
+          statusText.textContent = `Telegram-lähetys onnistui: ${payload.sentAt || "ok"}`;
+        } catch (error) {
+          statusText.textContent = `Telegram-lähetys epäonnistui: ${error.message}`;
+        }
+      }
+
       async function loadHistory() {
         const response = await fetch("/api/history");
         const payload = await response.json();
@@ -198,6 +221,7 @@
       }
 
       document.getElementById("refreshBtn").addEventListener("click", generateNow);
+      document.getElementById("telegramBtn").addEventListener("click", sendTelegram);
       document.getElementById("historyBtn").addEventListener("click", loadHistory);
 
       bootstrap().catch((error) => {

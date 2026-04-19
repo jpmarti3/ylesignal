@@ -5,6 +5,7 @@ import { createWorkersAI } from "workers-ai-provider";
 
 const APP_AGENT_NAME = "yle-signal";
 const YLE_RSS_URL = "https://yle.fi/rss/uutiset/tuoreimmat";
+const TELEGRAM_API_BASE = "https://api.telegram.org";
 
 type Story = {
   title: string;
@@ -30,6 +31,12 @@ type DailyDigest = {
   stories: DigestStory[];
 };
 
+type DeliveryState = {
+  telegramEnabled: boolean;
+  lastTelegramAt: string | null;
+  lastTelegramError: string | null;
+};
+
 export type BriefingState = {
   latestDigest: DailyDigest | null;
   digestHistory: DailyDigest[];
@@ -37,6 +44,7 @@ export type BriefingState = {
   lastRunAt: string | null;
   status: "idle" | "running" | "error";
   lastError: string | null;
+  delivery: DeliveryState;
 };
 
 function decodeXml(value: string): string {
@@ -134,11 +142,63 @@ function normalizeDigest(
   };
 }
 
+function formatTelegramDigest(digest: DailyDigest): string {
+  const storyLines = digest.stories
+    .slice(0, 3)
+    .map((story, index) => {
+      const number = index + 1;
+      return [
+        `${number}. ${story.title}`,
+        `Miksi tärkeä: ${story.whyItMatters}`,
+        `${story.link}`,
+      ].join("\n");
+    })
+    .join("\n\n");
+
+  return [
+    `🗞️ ${digest.headline}`,
+    digest.summary,
+    storyLines,
+    `Seuraa seuraavaksi: ${digest.watchNext}`,
+    `Luotu: ${digest.generatedAt}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function telegramIsConfigured(env: Env): boolean {
+  return Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID);
+}
+
+async function sendTelegramMessage(env: Env, text: string): Promise<void> {
+  if (!telegramIsConfigured(env)) {
+    throw new Error("Telegram ei ole määritetty. Lisää salaisuudet TELEGRAM_BOT_TOKEN ja TELEGRAM_CHAT_ID.");
+  }
+
+  const response = await fetch(`${TELEGRAM_API_BASE}/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify({
+      chat_id: env.TELEGRAM_CHAT_ID,
+      text,
+      disable_web_page_preview: false,
+    }),
+  });
+
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || payload?.ok === false) {
+    const description = payload?.description || `Telegram sendMessage failed with ${response.status}`;
+    throw new Error(description);
+  }
+}
+
 export class ScoutAgent extends Agent<Env> {
   async fetchLatestStories(limit = 12): Promise<Story[]> {
     const response = await fetch(YLE_RSS_URL, {
       headers: {
-        "user-agent": "yle-signal-demo/0.2",
+        "user-agent": "yle-signal-demo/0.3",
       },
     });
 
@@ -159,6 +219,11 @@ export class BriefingAgent extends Think<Env, BriefingState> {
     lastRunAt: null,
     status: "idle",
     lastError: null,
+    delivery: {
+      telegramEnabled: false,
+      lastTelegramAt: null,
+      lastTelegramError: null,
+    },
   };
 
   getModel() {
@@ -182,11 +247,15 @@ export class BriefingAgent extends Think<Env, BriefingState> {
     });
   }
 
-  async buildMorningDigest(payload?: { trigger?: string }): Promise<DailyDigest | null> {
+  async buildMorningDigest(payload?: { trigger?: string; sendTelegram?: boolean }): Promise<DailyDigest | null> {
     this.setState({
       ...this.state,
       status: "running",
       lastError: null,
+      delivery: {
+        ...this.state.delivery,
+        telegramEnabled: telegramIsConfigured(this.env),
+      },
     });
 
     try {
@@ -232,6 +301,30 @@ export class BriefingAgent extends Think<Env, BriefingState> {
       const seenLinks = Array.from(new Set([...selected.map((story) => story.link), ...this.state.seenLinks])).slice(0, 200);
       const digestHistory = [digest, ...this.state.digestHistory].slice(0, 14);
 
+      let delivery: DeliveryState = {
+        ...this.state.delivery,
+        telegramEnabled: telegramIsConfigured(this.env),
+        lastTelegramError: null,
+      };
+
+      if (payload?.sendTelegram !== false && telegramIsConfigured(this.env)) {
+        try {
+          await sendTelegramMessage(this.env, formatTelegramDigest(digest));
+          delivery = {
+            ...delivery,
+            lastTelegramAt: new Date().toISOString(),
+            lastTelegramError: null,
+          };
+        } catch (telegramError) {
+          const message = telegramError instanceof Error ? telegramError.message : String(telegramError);
+          delivery = {
+            ...delivery,
+            lastTelegramError: message,
+          };
+          console.error("Telegram delivery failed", telegramError);
+        }
+      }
+
       this.setState({
         ...this.state,
         latestDigest: digest,
@@ -240,9 +333,10 @@ export class BriefingAgent extends Think<Env, BriefingState> {
         lastRunAt: new Date().toISOString(),
         status: "idle",
         lastError: null,
+        delivery,
       });
 
-      console.log("Digest built", { trigger: payload?.trigger ?? "manual", stories: digest.stories.length });
+      console.log("Digest built", { trigger: payload?.trigger ?? "manual", stories: digest.stories.length, sentToTelegram: delivery.lastTelegramAt === digest.generatedAt || delivery.lastTelegramAt !== null });
       return digest;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -257,7 +351,25 @@ export class BriefingAgent extends Think<Env, BriefingState> {
   }
 
   async generateDigestNow(): Promise<DailyDigest | null> {
-    return this.buildMorningDigest({ trigger: "manual" });
+    return this.buildMorningDigest({ trigger: "manual", sendTelegram: true });
+  }
+
+  async sendLatestDigestToTelegram(): Promise<{ ok: true; sentAt: string }> {
+    if (!this.state.latestDigest) {
+      throw new Error("Katsausta ei ole vielä olemassa. Luo katsaus ensin.");
+    }
+
+    await sendTelegramMessage(this.env, formatTelegramDigest(this.state.latestDigest));
+    const sentAt = new Date().toISOString();
+    this.setState({
+      ...this.state,
+      delivery: {
+        telegramEnabled: telegramIsConfigured(this.env),
+        lastTelegramAt: sentAt,
+        lastTelegramError: null,
+      },
+    });
+    return { ok: true, sentAt };
   }
 
   getLatestDigest(): DailyDigest | null {
@@ -268,11 +380,15 @@ export class BriefingAgent extends Think<Env, BriefingState> {
     return this.state.digestHistory;
   }
 
-  getStatus(): Pick<BriefingState, "status" | "lastRunAt" | "lastError"> {
+  getStatus(): Pick<BriefingState, "status" | "lastRunAt" | "lastError" | "delivery"> {
     return {
       status: this.state.status,
       lastRunAt: this.state.lastRunAt,
       lastError: this.state.lastError,
+      delivery: {
+        ...this.state.delivery,
+        telegramEnabled: telegramIsConfigured(this.env),
+      },
     };
   }
 }
@@ -301,6 +417,18 @@ export default {
       try {
         const digest = await agent.generateDigestNow();
         return json({ ok: true, digest });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ ok: false, error: message }, 500);
+      }
+    }
+
+    if (url.pathname === "/api/send-telegram" && request.method === "POST") {
+      const agent = await getBriefingAgent(env);
+
+      try {
+        const result = await agent.sendLatestDigestToTelegram();
+        return json(result);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return json({ ok: false, error: message }, 500);
